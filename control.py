@@ -1,7 +1,7 @@
 # 2.3.3: On-policy Monte Carlo and SARSA control
 
-from pathlib import Path
 import csv
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,7 +9,6 @@ import numpy as np
 from environment import sim_game
 from features import feasible_actions, state_action_features, state_features
 from prediction import safe_default_opponent
-
 
 FEATURE_SIZES = {"baseline": 150, "quadratic": 300}
 

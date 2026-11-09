@@ -294,6 +294,3 @@ def state_action_features(s: list, a: tuple) -> np.ndarray:
 
     return features
 
-
-
-

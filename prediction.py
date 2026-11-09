@@ -1,10 +1,10 @@
 # 2.3.2: On-policy Monte Carlo and TD(0) prediction
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
-from environment import sim_game
 from default_opponent import default_opponent_policy
+from environment import sim_game
 from features import feasible_actions, state_action_features
 
 

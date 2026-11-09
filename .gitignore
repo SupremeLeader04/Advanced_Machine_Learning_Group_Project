@@ -4,3 +4,4 @@ test_game.ipynb
 __pycache__/
 *.png
 *.npz
+control_results/

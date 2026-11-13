@@ -12,12 +12,21 @@ def default_opponent_policy(state: list) -> list:
         list: The policy output containing speed investment and trading volume.
     """
     
+    B = float(state[1])
+
     # construct default speed investment:
     Z = np.random.uniform(0, 1)
-    delta = Z * np.sqrt(state[1])
+    delta = float(Z * np.sqrt(B))
 
     # construct default trading volume:
-    W = state[1] - delta**2
-    x = W * np.clip(state[5]/2, -1, 1)
+    W = B - delta**2
+    x = float(W * np.clip(state[5]/2, -1, 1))
+
+    # Keep the action feasible under the simulator's strict floating-point check.
+    while delta**2 > B:
+        delta = float(np.nextafter(delta, 0.0))
+
+    while delta**2 + abs(x) > B:
+        x = float(np.nextafter(x, 0.0))
 
     return [delta, x]

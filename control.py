@@ -6,9 +6,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from default_opponent import default_opponent_policy
 from environment import sim_game
 from features import feasible_actions, state_action_features, state_features
-from prediction import safe_default_opponent
 
 FEATURE_SIZES = {"baseline": 150, "quadratic": 300}
 
@@ -344,7 +344,7 @@ def evaluate_policy(
         np.random.seed(seed)
 
         firm_1 = (
-            safe_default_opponent
+            default_opponent_policy
             if theta is None
             else GreedyAgent(theta, features)
         )
@@ -355,7 +355,7 @@ def evaluate_policy(
             history = sim_game(
                 n=10,
                 policy_1=firm_1,
-                policy_2=safe_default_opponent
+                policy_2=default_opponent_policy
             )
 
             own.append(float(history[-1, 1]))
@@ -428,7 +428,7 @@ def train_control(
         history = sim_game(
             n=10,
             policy_1=agent,
-            policy_2=safe_default_opponent
+            policy_2=default_opponent_policy
         )
 
         terminal_budget = float(history[-1, 1])
@@ -490,7 +490,7 @@ def sample_strategy(
             history = sim_game(
                 n=10,
                 policy_1=GreedyAgent(theta, features),
-                policy_2=safe_default_opponent
+                policy_2=default_opponent_policy
             )
 
             for row in history[:-1]:

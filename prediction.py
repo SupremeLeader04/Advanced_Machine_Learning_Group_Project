@@ -31,27 +31,12 @@ def evaluation_policy(state: list) -> list:
     return list(actions[action_list_index])
 
 
-def safe_default_opponent(state: list) -> list:
-    """Runs the default opponent, correcting machine-precision overspending."""
-    delta, x = map(float, default_opponent_policy(state))
-    B = float(state[1])
-
-    # The environment rejects tiny floating-point overspending.
-    while delta**2 > B:
-        delta = float(np.nextafter(delta, 0.0))
-
-    while delta**2 + abs(x) > B:
-        x = float(np.nextafter(x, 0.0))
-
-    return [delta, x]
-
-
 def episode_data() -> tuple[np.ndarray, float]:
     """Simulates one game and extracts firm 1's 10 state-action feature vectors."""
     history = sim_game(
         n=10,
         policy_1=evaluation_policy,
-        policy_2=safe_default_opponent
+        policy_2=default_opponent_policy
     )
 
     # The first 10 rows are decision periods; the last row is terminal.

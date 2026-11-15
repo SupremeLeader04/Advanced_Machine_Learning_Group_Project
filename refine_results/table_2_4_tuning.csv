@@ -1,0 +1,17 @@
+parameter,value,reason
+speed grid u = δ²/B,"0, 0.0025, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7, 1",finer at small spends: δ=1 costs only 1% of B=100 but changes P(win) a lot
+trade grid v = |x|/W,"0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1",as in 2.3; direction = sign(g)
+"action terms h(s,a)",kept wealth (1-u) | (1-u) * P_win(default opp) * gain(v) | (1-u) * P_win(passive opp) * gain(v) | (1-u) * P_win(default opp)  [race position] | (1-u) * P_win(passive opp)  [race position] | (1-u) * v * P_win(default opp)  [bet size],interacted with the 50 state indicators of 2.3.1
+Q scaling,Q = B_t · θ_t'φ,value roughly proportional to wealth; target ratio ρ = B_{t+1}/B_t
+LSPI rounds,6,value curve flat after round 4
+games per round,6000,about 60k transitions per round
+behaviour ε (LSPI),0.1,0.1 and 0.2 gave the same final value
+replay buffer,6 rounds (all data),off-policy: old data stays valid
+ridge penalty,1.0,stabilises OLS for rarely visited bins
+Q-learning α_k,0.05/(1+k/20)^0.6,"decreasing step size, per batch"
+Q-learning ε_k,"max(0.05, 0.3/(1+k/10))",GLIE-style decay
+Q-learning TD-error clip,±5,limits rare huge ratios ρ
+actor-critic network,"59 inputs → 128 ReLU (shared) → actor 176 logits, critic 1",as in mini-problem set 6; inputs: 9 scaled state variables + 50 indicators
+actor-critic training,"12000 updates × 512 games, Adam lr 0.001/(1+5k/K), entropy 0.003","longer training / larger batches (2,048) gave the same value"
+actor-critic return,ρ = B_T/B_t clipped at 1000; standardised advantage; Huber critic,per-unit-wealth return as for LSPI; clipping limits rare huge returns
+pool training weights,"default 3, hold 1, all-in 1, look-ahead 1, const-speed-2 1, const-speed-5 1, self 2",robustness for the tournament

@@ -141,7 +141,7 @@ All three LSPI agents earn far more than 100 against every opponent we tried, be
 
 ```
 pip install numpy scipy matplotlib
-python refine_experiments.py      # trains the final agent -> rlagent/agentx_theta.npy (~5 min CPU)
+python refine_experiments.py      # trains the final agent -> rlagent/agentE_theta.npy (~5 min CPU)
 ```
 
 Set `RUN_EXPERIMENTS = True` at the top of `refine_experiments.py` to regenerate every figure and table of 2.4 in `refine_results/` (about 80 min on a 2-core CPU; the actor-critic also needs `pip install torch`). All seeds are fixed, so the numbers are reproduced exactly.
@@ -150,4 +150,4 @@ The 2.4 files are:
 - `refine_env.py`: a vectorised copy of `environment.sim_game` (checked against it), the closed-form trade gain, the one-step look-ahead benchmark and the opponent pool.
 - `refine.py`: the features, Q-learning, finite-horizon LSPI and the actor-critic.
 - `refine_experiments.py`: the entry point.
-- `rlagent/agentx.py` and `rlagent/agentx_theta.npy`: the tournament agent. Like the mini-problem sets, its learned data is a `.npy` file loaded with numpy. It needs only numpy and calls `policy(t, B_self, B_opp, S_self, S_opp, g, R) -> (delta, x)`.
+- `rlagent/agentE.py` and `rlagent/agentE_theta.npy`: the tournament agent. Like the mini-problem sets, its learned data is a `.npy` file loaded with numpy. It needs only numpy and calls `policy(t, B_self, B_opp, S_self, S_opp, g, R) -> (delta, x)`.

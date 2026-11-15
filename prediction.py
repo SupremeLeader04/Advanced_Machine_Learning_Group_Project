@@ -36,12 +36,12 @@ def evaluation_policy(state: list) -> list:
     return list(actions[action_list_index])
 
 
-def episode_data() -> tuple[np.ndarray, float]:
+def episode_data(policy_1=evaluation_policy, policy_2=default_opponent_policy) -> tuple[np.ndarray, float]:
     """Simulates one game and extracts firm 1's 10 state-action feature vectors."""
     history = sim_game(
         n=10,
-        policy_1=evaluation_policy,
-        policy_2=default_opponent_policy
+        policy_1=policy_1,
+        policy_2=policy_2
     )
 
     # The first 10 rows are decision periods; the last row is terminal.

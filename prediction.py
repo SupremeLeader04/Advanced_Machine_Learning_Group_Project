@@ -1,9 +1,8 @@
 # 2.3.2: On-policy Monte Carlo and TD(0) prediction
 
-from pathlib import Path
 import csv
+from pathlib import Path
 
-import numpy as np
 import matplotlib.pyplot as plt
 import numpy as np
 

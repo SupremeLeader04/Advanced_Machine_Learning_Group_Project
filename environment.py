@@ -138,15 +138,15 @@ def sim_game(
 
         # forming move:
         epsilon_t = np.random.normal(loc=0.0, scale=1.5 * np.sqrt(1 - R_t**2))
-        delta = g_t + epsilon_t
+        price_move = g_t + epsilon_t
 
         # settle trade of winning firm:
         if selection == 1:
-            s[1] = max(0, W_1_new + pi_1[1] * delta)
+            s[1] = max(0, W_1_new + pi_1[1] * price_move)
             s[2] = W_2_new
         else:
             s[1] = W_1_new
-            s[2] = max(0, W_2_new + pi_2[1] * delta)
+            s[2] = max(0, W_2_new + pi_2[1] * price_move)
 
         # apply random speed decay:
         d_1 = (np.random.uniform(0, np.sqrt(0.1)))**2

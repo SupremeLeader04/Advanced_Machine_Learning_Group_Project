@@ -28,11 +28,13 @@ def default_batch(st, rng):
 
 
 def hold_batch(st, rng):
+    """Benchmark: never invest in speed, never trade (keeps B = 100)."""
     z = np.zeros_like(st["B_self"])
     return z, z
 
 
 def _feasible(delta, x, B):
+    """Clip actions to the budget constraint delta >= 0, delta^2 + |x| <= B."""
     delta = np.clip(np.nan_to_num(delta), 0, np.sqrt(B))
     W = np.maximum(B - delta**2, 0)
     x = np.clip(np.nan_to_num(x), -W, W)
@@ -53,20 +55,25 @@ def play(policy_1, policy_2, n_games, seed=0, record=False, callback=None):
     S2 = np.zeros(n_games)
     log = []
     for t in range(T):
+        # signal informativeness R ~ U[0,1] and public signal g ~ N(0, R^2 sigma^2)
         R = rng.uniform(0, 1, n_games)
         g = rng.normal(0, 1, n_games) * R * SIGMA
         tt = np.full(n_games, t)
+        # each firm sees the state from its own perspective
         st1 = dict(t=tt, B_self=B1, B_opp=B2, S_self=S1, S_opp=S2, g=g, R=R)
         st2 = dict(t=tt, B_self=B2, B_opp=B1, S_self=S2, S_opp=S1, g=g, R=R)
         d1, x1 = policy_1(st1, rng)
         d2, x2 = policy_2(st2, rng)
-        d1, x1, W1 = _feasible(d1, x1, B1)
+        d1, x1, W1 = _feasible(d1, x1, B1)     # W = wealth after paying delta^2
         d2, x2, W2 = _feasible(d2, x2, B2)
-        e1, e2 = S1 + d1, S2 + d2
+        e1, e2 = S1 + d1, S2 + d2              # effective speeds
+        # softmax lottery: P(firm 1 wins) = exp(2 e1) / (exp(2 e1) + exp(2 e2))
         p1 = 1.0 / (1.0 + np.exp(np.clip(2 * (e2 - e1), -700, 700)))
         win1 = rng.uniform(0, 1, n_games) < p1
+        # price move Delta = g + eps with eps ~ N(0, (1 - R^2) sigma^2)
         eps = rng.normal(0, 1, n_games) * SIGMA * np.sqrt(1 - R**2)
         move = g + eps
+        # only the winner trades; budgets cannot fall below 0
         nB1 = np.where(win1, np.maximum(0, W1 + x1 * move), W1)
         nB2 = np.where(~win1, np.maximum(0, W2 + x2 * move), W2)
         if record:
@@ -74,6 +81,7 @@ def play(policy_1, policy_2, n_games, seed=0, record=False, callback=None):
                             delta_opp=d2, B_next=nB1))
         if callback is not None:
             callback(t, st1, (d1, x1), win1, nB1)
+        # random speed decay: S_{t+1} = (1 - d) * effective speed, d = U^2, U ~ U[0, sqrt(0.1)]
         U1 = rng.uniform(0, np.sqrt(0.1), n_games)
         U2 = rng.uniform(0, np.sqrt(0.1), n_games)
         S1 = e1 * (1 - U1**2)
@@ -95,6 +103,7 @@ def play_chunked(policy_1, policy_2, n_games, seed=0, chunk=5000):
 
 
 def summarise(B1, B2):
+    """Summary of firm 1's terminal budgets: mean, standard error, median, win rate."""
     n = len(B1)
     return dict(mean=float(B1.mean()), se=float(B1.std(ddof=1) / np.sqrt(n)),
                 median=float(np.median(B1)), win_rate=float(np.mean(B1 > B2)),
@@ -125,7 +134,12 @@ Z_NODES = (np.arange(20) + 0.5) / 20  # quadrature for opponent's Z ~ U[0,1]
 
 
 def trade_gain(g, R, f=1.0):
-    """E[max(0, 1 + f*sign(g)*Delta)] - 1 per unit of wealth, given g, R."""
+    """E[max(0, 1 + f*sign(g)*Delta)] - 1 per unit of wealth, given g, R.
+
+    Given the signal, f*sign(g)*Delta ~ N(f|g|, f^2 (1-R^2) sigma^2), so
+    Y = 1 + f*sign(g)*Delta is normal with mean mu and s.d. s, and
+    E[max(0, Y)] = mu * Phi(mu/s) + s * phi(mu/s)  (mean of a normal floored at 0).
+    """
     g = np.asarray(g, float)
     R = np.asarray(R, float)
     mu = 1 + f * np.abs(g)
@@ -158,9 +172,10 @@ def myopic_batch(opp_model="default", trade_f=1.0, speed_value=0.0):
         cost = DELTA_GRID[:, None] ** 2
         W = np.maximum(B[None, :] - cost, 0)
         G = trade_gain(g, R, trade_f)[None, :]
+        # one-period expected profit: P(win) * W * gain - speed cost (+ optional speed value)
         value = p * W * G - cost + speed_value * DELTA_GRID[:, None]
-        value = np.where(cost <= B[None, :], value, -np.inf)
-        k = np.argmax(value, axis=0)
+        value = np.where(cost <= B[None, :], value, -np.inf)   # unaffordable speeds excluded
+        k = np.argmax(value, axis=0)           # best delta on the grid, per game
         delta = DELTA_GRID[k]
         W = np.maximum(B - delta**2, 0)
         x = np.sign(g) * trade_f * W
@@ -169,6 +184,7 @@ def myopic_batch(opp_model="default", trade_f=1.0, speed_value=0.0):
 
 
 def allin_nospeed(st, rng=None):
+    """Opponent type: no speed investment, bets the whole budget on sign(g)."""
     z = np.zeros_like(st["B_self"])
     return z, np.sign(st["g"]) * st["B_self"]
 
@@ -188,12 +204,15 @@ def const_speed(delta_level, trade_f=1.0):
 class Mixture:
     """Each game is assigned one opponent from the pool for its whole duration."""
     def __init__(self, pool, weights=None):
+        """pool: list of batched policies; weights: relative sampling weights."""
         self.pool = pool
         self.w = np.ones(len(pool)) / len(pool) if weights is None else np.asarray(weights) / np.sum(weights)
         self.assign = None
 
     def __call__(self, st, rng):
+        """Act for every game with that game's assigned opponent."""
         n = len(st["B_self"])
+        # draw a fresh assignment at the start of each batch of games
         if int(st["t"][0]) == 0 or self.assign is None or len(self.assign) != n:
             self.assign = rng.choice(len(self.pool), size=n, p=self.w)
         d = np.zeros(n); x = np.zeros(n)
@@ -206,6 +225,7 @@ class Mixture:
 
 
 def standard_pool():
+    """Opponent types used for the robustness checks and pool training."""
     return {
         "default": default_batch,
         "hold cash": hold_batch,

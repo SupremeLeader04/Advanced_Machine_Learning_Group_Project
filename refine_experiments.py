@@ -53,6 +53,7 @@ if os.environ.get("REFINE_QUICK"):
 
 
 def main():
+    """Train the final agent and save its weights; optionally run all experiments."""
     from refine import train_backward
     t0 = time.time()
     theta, curve = train_backward(**FINAL_CFG)
@@ -67,6 +68,7 @@ def main():
 # Experiments
 # ---------------------------------------------------------------------------
 def run_experiments(theta_final, curve_final):
+    """Reproduce every table and figure of the 2.4 write-up (RUN_EXPERIMENTS = True)."""
     import refine
     from refine import ac_policy, greedy_batch, train_ac, train_backward, train_qlearning
     from refine_env import (Mixture, default_batch, hold_batch, myopic_batch,
@@ -94,6 +96,8 @@ def run_experiments(theta_final, curve_final):
                         **summarise(b1, b2), p_zero=float(np.mean(b1 == 0)),
                         p_above_100=float(np.mean(b1 > 100)))
 
+    # opponents for pool training: the standard pool, any `extra` agents, and the
+    # agent's own current policy (self-play), re-drawn every LSPI round
     def pool_factory(extra):
         def factory(theta):
             pool = list(standard_pool().values()) + extra
@@ -113,7 +117,7 @@ def run_experiments(theta_final, curve_final):
               "LSPI fictitious play": greedy_batch(th_fp),
               "Q-learning (incremental)": greedy_batch(th_ql)}
 
-    # 3) held-out performance against the default
+    # 3) held-out performance against the default (same 50,000 test games for all)
     rows, budgets = [], {}
     bench = {"Default (firm 1 also default)": default_batch, "Hold cash": hold_batch,
              "One-step look-ahead (model-based)": myopic_batch("default")}
@@ -127,7 +131,7 @@ def run_experiments(theta_final, curve_final):
     rows += [ablation_row] + evaluate_23_baselines()
     _write_csv("table_2_4_performance_vs_default.csv", rows)
 
-    # 4) robustness matrix
+    # 4) robustness matrix: every agent against every opponent type
     opponents = {**standard_pool(), **agents}
     robust = []
     for an, ap in agents.items():
@@ -162,6 +166,7 @@ def evaluate_23_baselines(n_games=2000):
 
 
 def _write_csv(name, rows):
+    """Write a list of dicts to refine_results/<name> (columns = union of keys)."""
     cols = list(dict.fromkeys(k for r in rows for k in r))
     with open(OUT / name, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
@@ -170,6 +175,7 @@ def _write_csv(name, rows):
 
 
 def write_tuning_table():
+    """Write the table of tuning choices (table_2_4_tuning.csv)."""
     from refine import H_NAMES, SPEED_FRACS, TRADE_FRACS
     rows = [
         ("speed grid u = δ²/B", ", ".join(f"{x:g}" for x in SPEED_FRACS),
@@ -202,13 +208,14 @@ def write_tuning_table():
 # Figures
 # ---------------------------------------------------------------------------
 def make_figures(perf, curves, budgets, robust, theta_final):
+    """Draw the five 2.4 figures from the experiment results."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     blue, grey = "#1f77b4", "#7f7f7f"
     ref = {r["name"]: r["mean"] for r in perf}
 
-    # learning curves
+    # Figure: learning curves (greedy-policy value during training)
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), sharey=True)
     for key, lab, col in [("final", "LSPI finite-horizon (vs default) – final", blue),
                           ("pool", "LSPI pool-trained", "#ff7f0e"),
@@ -235,7 +242,7 @@ def make_figures(perf, curves, budgets, robust, theta_final):
     axes[2].set(xlabel="Actor-critic update (512 games per update)", title="Actor-critic (neural network)")
     _save(fig, "fig_2_4_learning_curves.png")
 
-    # performance vs default
+    # Figure: held-out performance of every policy against the default
     p = sorted(perf, key=lambda r: r["mean"])
     fig, ax = plt.subplots(figsize=(9, 5.5))
     names = [r["name"] for r in p]
@@ -251,7 +258,7 @@ def make_figures(perf, curves, budgets, robust, theta_final):
            title="Held-out performance against the default strategy")
     _save(fig, "fig_2_4_performance_vs_default.png")
 
-    # policy description
+    # Figure: what the final policy does (replay 20,000 games and log its choices)
     from refine import U_GRID, V_GRID, greedy_batch
     from refine_env import default_batch, play
     pol = greedy_batch(theta_final); idx = []
@@ -294,7 +301,7 @@ def make_figures(perf, curves, budgets, robust, theta_final):
         a.grid(alpha=.25)
     _save(fig, "fig_2_4_policy.png")
 
-    # wealth distribution
+    # Figure: distribution of terminal wealth and of tournament-sized averages
     bf, bl = budgets["LSPI finite-horizon (final)"], budgets["One-step look-ahead (model-based)"]
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     for arr, lab, col in [(bf, "LSPI final", blue), (bl, "One-step look-ahead", "k")]:
@@ -315,7 +322,7 @@ def make_figures(perf, curves, budgets, robust, theta_final):
         a.grid(alpha=.25)
     _save(fig, "fig_2_4_wealth_distribution.png")
 
-    # robustness heat map
+    # Figure: robustness heat map (agents x opponents)
     rows_ = list(dict.fromkeys(r["agent"] for r in robust))
     cols_ = list(dict.fromkeys(r["opponent"] for r in robust))
     M = np.array([[next(x["mean"] for x in robust if x["agent"] == a and x["opponent"] == o)
@@ -333,6 +340,7 @@ def make_figures(perf, curves, budgets, robust, theta_final):
 
 
 def _save(fig, name):
+    """Save a figure to refine_results/ and close it."""
     fig.tight_layout()
     fig.savefig(OUT / name, dpi=200)
     import matplotlib.pyplot as plt

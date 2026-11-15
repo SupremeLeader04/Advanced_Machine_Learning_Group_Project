@@ -44,15 +44,21 @@ N_ACTIONS = len(U_GRID)
 # State features: same 50 indicators as features.state_features, vectorised
 # ---------------------------------------------------------------------------
 def _onehot(idx, k):
+    """One-hot rows: column idx[i] of row i is 1, all others 0."""
     out = np.zeros((len(idx), k))
     out[np.arange(len(idx)), idx] = 1
     return out
 
 
 def state_features_batch(st):
-    """Vectorised version of features.state_features (identical bins)."""
+    """Vectorised version of features.state_features (identical bins).
+
+    Returns an (n, 50) matrix: time (5) | own budget (8) | opponent budget (8) |
+    speed difference (7) | informativeness R (10) | sign of g (3) | |g| (9).
+    """
     t = st["t"].astype(int)
     d = st["S_self"] - st["S_opp"]
+    # speed-difference bins (-inf,-5), [-5,-3), [-3,0), {0}, (0,3), [3,5), [5,inf)
     sp = np.select([d < -5, d < -3, d < 0, d == 0, d < 3, d < 5],
                    [0, 1, 2, 3, 4, 5], 6)
     g = st["g"]
@@ -91,10 +97,11 @@ def action_terms(st, u, v):
         vv = np.broadcast_to(v[None, :], (n, len(v)))
         return np.stack([np.ones_like(uu), uu, vv, uu * uu, vv * vv, uu * vv], axis=2)
     B = st["B_self"][:, None]
-    delta = np.sqrt(u[None, :] * B)                                   # (n, k)
-    kept = np.broadcast_to(1 - u[None, :], delta.shape)
+    delta = np.sqrt(u[None, :] * B)          # speed investment implied by u = delta^2 / B
+    kept = np.broadcast_to(1 - u[None, :], delta.shape)   # share of wealth left after speed cost
+    # expected one-period return per unit of wealth when betting share f on sign(g)
     gain = np.stack([trade_gain(st["g"], st["R"], f) for f in TRADE_FRACS], 1)  # (n, 11)
-    gv = gain[:, np.round(v * 10).astype(int)]                         # (n, k)
+    gv = gain[:, np.round(v * 10).astype(int)]  # pick the gain for each action's trade share v
     # win probabilities against a default-like and a passive opponent
     p_def = _p_win(delta, st, np.sqrt(st["B_opp"]))
     p_pas = _p_win(delta, st, np.zeros_like(st["B_opp"]))
@@ -106,7 +113,12 @@ _Z = (np.arange(20) + 0.5) / 20
 
 
 def _p_win(delta, st, opp_scale):
-    """P(win) when opponent invests Z*opp_scale, Z ~ U[0,1]; delta shape (n, k)."""
+    """P(win) when opponent invests Z*opp_scale, Z ~ U[0,1]; delta shape (n, k).
+
+    The softmax lottery gives P(win) = sigmoid(2 * (own speed - opponent speed));
+    the expectation over the opponent's random Z uses 20 quadrature points (_Z).
+    opp_scale = sqrt(B_opp) mimics the default opponent, 0 a passive opponent.
+    """
     z = 2 * (st["S_self"][:, None, None] + delta[:, :, None]
              - st["S_opp"][:, None, None] - opp_scale[:, None, None] * _Z)
     return (1 / (1 + np.exp(-np.clip(z, -50, 50)))).mean(axis=2)
@@ -137,6 +149,11 @@ def phi_of(z, h_sel):
 
 
 def actions_from_index(st, idx):
+    """Convert grid indices to the game's actions (delta, x).
+
+    delta = sqrt(u * B) so that the speed cost delta^2 is a share u of the budget;
+    x bets a share v of the post-cost wealth W = B - delta^2 in the direction of g.
+    """
     u, v = U_GRID[idx], V_GRID[idx]
     B = st["B_self"]
     delta = np.sqrt(u * B)
@@ -148,16 +165,17 @@ def actions_from_index(st, idx):
 # Policies
 # ---------------------------------------------------------------------------
 def greedy_batch(theta, epsilon=0.0):
+    """Batched (epsilon-)greedy policy w.r.t. the linear Q-function with weights theta."""
     def policy(st, rng):
         n, chunk = len(st["B_self"]), 4000
         idx = np.empty(n, dtype=int)
-        for s in range(0, n, chunk):
+        for s in range(0, n, chunk):           # chunks keep memory small for many games
             z, h = phi_all(_sub(st, np.arange(n)[s:s + chunk]))
             idx[s:s + chunk] = np.argmax(q_all(_th(theta, st), z, h), axis=1)
-        if epsilon > 0:
+        if epsilon > 0:                        # explore: uniformly random grid action
             explore = rng.uniform(size=len(idx)) < epsilon
             idx = np.where(explore, rng.integers(0, N_ACTIONS, len(idx)), idx)
-        policy.last_idx = idx
+        policy.last_idx = idx                  # remembered so collect() can log the actions
         return actions_from_index(st, idx)
     return policy
 
@@ -171,11 +189,13 @@ def collect(theta, epsilon, opponent, n_games, seed):
     Each transition: (z, h_chosen, rho, z', h'(all actions), terminal).
     States with zero wealth are absorbing (value 0) and dropped.
     """
+    # first round (theta None): a purely random behaviour policy
     pol = greedy_batch(theta if theta is not None else np.zeros(N_PARAMS),
                        epsilon if theta is not None else 1.0)
     idx_log = []
 
     def cb(t, st, a, win, B_next):
+        """Record which grid action was taken in each period."""
         idx_log.append(pol.last_idx.copy())
 
     B1, B2, log = play(pol, opponent, n_games, seed=seed, record=True, callback=cb)
@@ -186,7 +206,7 @@ def collect(theta, epsilon, opponent, n_games, seed):
         sa = _sub(st, alive)
         idx = idx_log[t][alive]
         h_sel = _h_chosen(sa, idx)
-        rho = log[t]["B_next"][alive] / st["B_self"][alive]
+        rho = log[t]["B_next"][alive] / st["B_self"][alive]   # wealth ratio B_{t+1} / B_t
         item = dict(z=state_features_batch(sa).astype(np.float32),
                     h=h_sel.astype(np.float32), rho=rho, terminal=t == T - 1, t=t)
         if t < T - 1:
@@ -232,6 +252,7 @@ def _th(theta, st):
 
 
 def _sub(st, mask):
+    """Select the games in `mask` from a dict of state arrays."""
     return {k: v[mask] for k, v in st.items()}
 
 
@@ -286,22 +307,24 @@ def fit_backward(buffer, ridge=1.0, theta_init=None):
     rho * max_a' Q_9(s', a'), ... This is batch Q-learning / approximate DP.
     """
     theta = np.zeros((T, N_PARAMS)) if theta_init is None else theta_init.copy()
-    for t in reversed(range(T)):
-        A = ridge * np.eye(N_PARAMS)
+    for t in reversed(range(T)):               # t = 9, 8, ..., 0
+        A = ridge * np.eye(N_PARAMS)           # ridge-regularised normal equations
         b = np.zeros(N_PARAMS)
-        for chunk in buffer:
+        for chunk in buffer:                   # all rounds of data in the replay buffer
             d = chunk[t]
             phi = phi_of(d["z"], d["h"]).astype(float)
             if d["terminal"]:
-                y = d["rho"]
+                y = d["rho"]                   # last period: target is B_10 / B_9
             else:
+                # Q-learning target: rho * max_a' Q_{t+1}(s', a'), using the weights
+                # theta[t+1] fitted in the previous step; bankrupt next states are worth 0
                 nxt = np.zeros(len(phi))
                 if d["ok"].any():
                     _, nxt[d["ok"]] = greedy_next(theta, d["next"])
                 y = d["rho"] * nxt
             A += phi.T @ phi
             b += phi.T @ y
-        theta[t] = np.linalg.solve(A, b)
+        theta[t] = np.linalg.solve(A, b)       # OLS (ridge) fit for period t
     return theta
 
 
@@ -317,8 +340,11 @@ def train_backward(opponent=default_batch, n_rounds=6, games_per_round=8000,
     theta, buffer, curve = None, [], []
     for r in range(n_rounds):
         train_opp = opponent if opponent_factory is None else opponent_factory(theta)
+        # 1) new data from the current epsilon-greedy policy
         data, _ = collect(theta, epsilon, train_opp, games_per_round, seed + 1000 * r)
+        # 2) keep the last `buffer_rounds` rounds (off-policy, so old data stays valid)
         buffer = (buffer + [data])[-buffer_rounds:]
+        # 3) policy improvement: refit all periods backwards on the whole buffer
         theta = fit_backward(buffer, ridge)
         res = evaluate(theta, opponent, eval_games, seed=777)
         curve.append(res)
@@ -347,7 +373,7 @@ def train_qlearning(opponent=default_batch, n_batches=60, games_per_batch=500,
         data, _ = collect(theta if k else None, eps, opponent, games_per_batch, seed + k)
         for d in reversed(data):                       # backwards = faster propagation
             phi = phi_of(d["z"], d["h"])
-            pred = phi @ theta
+            pred = phi @ theta                         # current normalised Q(s, a)
             if d["terminal"]:
                 target = d["rho"]
             else:
@@ -356,7 +382,7 @@ def train_qlearning(opponent=default_batch, n_batches=60, games_per_batch=500,
                     _, nxt[d["ok"]] = greedy_next(theta, d["next"])
                 target = d["rho"] * nxt
             err = np.clip(target - pred, -5, 5)        # clip rare huge ratios
-            theta += alpha * phi.T @ err / len(phi)
+            theta += alpha * phi.T @ err / len(phi)    # semi-gradient step, averaged over batch
         if (k + 1) % eval_every == 0:
             res = evaluate(theta, opponent, eval_games, seed=777)
             curve.append((k + 1, res))
@@ -367,6 +393,7 @@ def train_qlearning(opponent=default_batch, n_batches=60, games_per_batch=500,
 
 
 def evaluate(theta, opponent, n_games=20000, seed=777):
+    """Mean/median terminal budget of the greedy policy over n_games (fixed seed)."""
     B1, B2 = play_chunked(greedy_batch(theta), opponent, n_games, seed=seed)
     return summarise(B1, B2)
 
@@ -395,12 +422,14 @@ def _actor_critic_class():
         """Shared layer, actor head (action preferences) and critic head, as in PS6."""
 
         def __init__(self, n_in=AC_N_IN, hidden=128, n_actions=N_ACTIONS):
+            """Shared hidden layer, then one logit per action and one state value."""
             super().__init__()
             self.common = nn.Linear(n_in, hidden)
             self.actor = nn.Linear(hidden, n_actions)
             self.critic = nn.Linear(hidden, 1)
 
         def forward(self, x):
+            """Return (action logits, state value) for a batch of inputs."""
             h = F.relu(self.common(x))
             return self.actor(h), self.critic(h).squeeze(-1)
 
@@ -408,6 +437,7 @@ def _actor_critic_class():
 
 
 def ac_policy(model, greedy=False):
+    """Batched policy from the actor: argmax (greedy) or sampled from the softmax."""
     import torch
 
     def policy(st, rng):
@@ -418,7 +448,7 @@ def ac_policy(model, greedy=False):
             else:
                 p = torch.softmax(logits, 1).numpy().astype(float)
                 p /= p.sum(1, keepdims=True)
-                c = p.cumsum(1)
+                c = p.cumsum(1)                        # inverse-CDF sampling per game
                 idx = (rng.uniform(size=(len(p), 1)) < c).argmax(1)
         policy.last_idx = idx
         return actions_from_index(st, idx)
@@ -444,10 +474,12 @@ def train_ac(n_updates=12000, games=512, lr=1e-3, entropy=0.003, clip_return=100
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda k: 1 / (1 + 5 * k / n_updates))
     curve = []
     for k in range(n_updates):
+        # 1) play a batch of games with the current stochastic policy
         pol = ac_policy(model)
         idx_log = []
         _, _, log = play(pol, opponent, games, seed=seed * 100000 + k, record=True,
                          callback=lambda *a: idx_log.append(pol.last_idx.copy()))
+        # 2) Monte-Carlo return of every visited state, per unit of wealth: B_T / B_t
         BT = log[-1]["B_next"]
         X, A, G = [], [], []
         for t in range(T):
@@ -458,13 +490,14 @@ def train_ac(n_updates=12000, games=512, lr=1e-3, entropy=0.003, clip_return=100
             G.append(np.minimum(BT[alive] / st["B_self"][alive], clip_return))  # return per unit of wealth
         X = torch.from_numpy(np.vstack(X)); A = torch.from_numpy(np.concatenate(A)).long()
         G = torch.from_numpy(np.concatenate(G).astype(np.float32))
+        # 3) losses: advantage-weighted log-probabilities (actor), Huber (critic)
         logits, V = model(X)
         logp = torch.log_softmax(logits, 1)
         adv = (G - V).detach()
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)                  # standardise, as in PS6
         actor_loss = -(logp.gather(1, A[:, None]).squeeze(1) * adv).mean()
         critic_loss = F.huber_loss(V, G)
-        ent = -(logp.exp() * logp).sum(1).mean()
+        ent = -(logp.exp() * logp).sum(1).mean()       # entropy bonus keeps exploring
         loss = actor_loss + critic_loss - entropy * ent
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         if (k + 1) % eval_every == 0:

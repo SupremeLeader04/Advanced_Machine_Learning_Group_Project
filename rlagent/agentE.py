@@ -17,23 +17,29 @@ from pathlib import Path
 
 import numpy as np
 
+# learned weights: one row per period t = 0..9, 300 weights each (50 state x 6 action terms)
 _THETA = np.load(Path(__file__).resolve().parent / "agentE_theta.npy")   # (10, 50*6)
 
-SIGMA = 1.5
-T = 10
+SIGMA = 1.5   # s.d. of the price move
+T = 10        # number of periods
+
+# Action grid: speed spend u = delta^2 / B (finer at small values) and
+# trade share v = |x| / W of post-cost wealth; trade direction = sign(g).
 SPEED_FRACS = np.array([0, .0025, .005, .01, .02, .03, .05, .075, .1, .15,
                         .2, .3, .4, .5, .7, 1.0])
 TRADE_FRACS = np.linspace(0, 1, 11)
 U_GRID, V_GRID = [a.ravel() for a in np.meshgrid(SPEED_FRACS, TRADE_FRACS, indexing="ij")]
-_Z = (np.arange(20) + 0.5) / 20
-N_Z, N_H = 50, 6
+_Z = (np.arange(20) + 0.5) / 20   # quadrature points for the opponent's Z ~ U[0,1]
+N_Z, N_H = 50, 6                   # 50 state indicators, 6 action terms
 
 
 def _ncdf(x):
+    """Standard normal CDF."""
     return 0.5 * (1 + erf(x / sqrt(2)))
 
 
 def _npdf(x):
+    """Standard normal density."""
     return exp(-0.5 * x * x) / sqrt(2 * pi)
 
 
@@ -45,6 +51,7 @@ def _trade_gain(g, R, f):
 
 
 def _onehot(i, k):
+    """Length-k vector with a 1 in position i."""
     v = np.zeros(k)
     v[i] = 1
     return v
@@ -68,17 +75,23 @@ def _state_features(t, B_self, B_opp, S_self, S_opp, g, R):
 
 
 def _p_win(delta, S_self, S_opp, opp_scale):
+    """Win probability of the speed race for each candidate delta.
+
+    Softmax lottery: P(win) = sigmoid(2 * (own speed - opponent speed)), averaged
+    over an opponent investment of Z * opp_scale with Z ~ U[0,1].
+    """
     z = 2 * (S_self + delta[:, None] - S_opp - opp_scale * _Z[None, :])
     return (1 / (1 + np.exp(-np.clip(z, -50, 50)))).mean(axis=1)
 
 
 def _action_terms(B_self, B_opp, S_self, S_opp, g, R):
-    delta = np.sqrt(U_GRID * B_self)
-    kept = 1 - U_GRID
+    """The 6 action terms h(s, a) for all 176 grid actions (see refine.py)."""
+    delta = np.sqrt(U_GRID * B_self)                 # speed investment of each action
+    kept = 1 - U_GRID                                # wealth share left after speed cost
     gains = np.array([_trade_gain(g, R, f) for f in TRADE_FRACS])
     gv = gains[np.round(V_GRID * 10).astype(int)]
-    p_def = _p_win(delta, S_self, S_opp, sqrt(B_opp))
-    p_pas = _p_win(delta, S_self, S_opp, 0.0)
+    p_def = _p_win(delta, S_self, S_opp, sqrt(B_opp))   # vs a default-like opponent
+    p_pas = _p_win(delta, S_self, S_opp, 0.0)           # vs a passive opponent
     return np.stack([kept, kept * p_def * gv, kept * p_pas * gv,
                      kept * p_def, kept * p_pas, kept * V_GRID * p_def], axis=1)
 
@@ -87,12 +100,13 @@ def policy(t, B_self, B_opp, S_self, S_opp, g, R):
     """Return (delta, x): speed investment and trading position for this period."""
     t, B_self, B_opp = int(t), float(B_self), float(B_opp)
     S_self, S_opp, g, R = float(S_self), float(S_opp), float(g), float(R)
-    if B_self <= 0:
+    if B_self <= 0:                    # bankrupt: nothing to do
         return 0.0, 0.0
-    t_idx = min(max(t, 0), T - 1)
+    t_idx = min(max(t, 0), T - 1)      # guard against out-of-range inputs
     z = _state_features(t_idx, B_self, max(B_opp, 0.0), max(S_self, 0.0),
                         max(S_opp, 0.0), g, min(max(R, 0.0), 1.0))
     h = _action_terms(B_self, max(B_opp, 0.0), S_self, S_opp, g, min(max(R, 0.0), 1.0))
+    # Q-value per unit of wealth for every action: z' Theta_t h(a); pick the best
     q = h @ (z @ _THETA[t_idx].reshape(N_Z, N_H))
     k = int(np.argmax(q))
     delta = float(np.sqrt(U_GRID[k] * B_self))

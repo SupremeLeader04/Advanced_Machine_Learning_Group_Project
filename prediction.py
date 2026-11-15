@@ -1,11 +1,17 @@
 # 2.3.2: On-policy Monte Carlo and TD(0) prediction
 
+from pathlib import Path
+import csv
+
+import numpy as np
 import matplotlib.pyplot as plt
 import numpy as np
 
 from default_opponent import default_opponent_policy
 from environment import sim_game
 from features import feasible_actions, state_action_features
+
+OUTPUT_DIR = Path(__file__).resolve().parent / "prediction"
 
 
 def evaluation_policy(state: list) -> list:
@@ -204,6 +210,8 @@ def run_experiment(
 ) -> None:
     """Compares MC and TD on unseen games and creates figures for the report."""
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     X_val, y_val = validation_data(n_validation, seed=2030)
 
     mc_runs = []
@@ -293,7 +301,7 @@ def run_experiment(
     ax.grid(alpha=0.25)
 
     fig.tight_layout()
-    fig.savefig("prediction_comparison.png", dpi=200)
+    fig.savefig(OUTPUT_DIR / "prediction_comparison.png", dpi=200)
     plt.close(fig)
 
     steps = np.arange(1, n_episodes + 1)
@@ -321,22 +329,210 @@ def run_experiment(
     ax.grid(alpha=0.25)
 
     fig.tight_layout()
-    fig.savefig("prediction_learning_rate.png", dpi=200)
+    fig.savefig(OUTPUT_DIR / "prediction_learning_rate.png", dpi=200)
     plt.close(fig)
     
     # Save trained weights from every seed for later evaluation.
     np.savez(
-        "prediction_weights.npz",
+        OUTPUT_DIR / "prediction_weights.npz",
         theta_mc=np.array(mc_weights),
         theta_td=np.array(td_weights)
     )
 
     print(
-        "\nSaved: prediction_comparison.png, "
+        f"\nSaved in {OUTPUT_DIR}: prediction_comparison.png, "
         "prediction_learning_rate.png, prediction_weights.npz"
     )
 
 
+def compare_learning_rates(
+    n_episodes: int = 3000,
+    n_validation: int = 400,
+    n_seeds: int = 3,
+    output_dir: str | Path | None = None,
+) -> None:
+    """Compare learning rates on validation games and save two CSV tables."""
+
+    if min(n_episodes, n_validation, n_seeds) < 1:
+        raise ValueError("Episodes, validation games and seeds must be positive.")
+
+    output_dir = Path(output_dir) if output_dir is not None else (
+        OUTPUT_DIR / "learning_rate_comparison"
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    seeds = list(range(123, 123 + n_seeds))
+
+    rates = {
+        "MC": [0.001, 0.0005, 0.00025],
+        "TD": [0.005, 0.0075, 0.01]
+    }
+
+    X_val, y_val = validation_data(n_games=n_validation, seed=2030)
+
+    seed_rows = []
+    summary_rows = []
+
+    # Pairing rates saves simulation work; the learners have separate weights.
+    for alpha_mc, alpha_td in zip(rates["MC"], rates["TD"]):
+
+        final_errors = {"MC": [], "TD": []}
+
+        for seed in seeds:
+
+            print(
+                f"Training seed {seed}: MC={alpha_mc:g}, TD={alpha_td:g}",
+                flush=True
+            )
+
+            _, _, _, mc_errors, td_errors = train_predictors(
+                n_episodes,
+                X_val,
+                y_val,
+                seed=seed,
+                evaluate_every=100,
+                alpha_mc=alpha_mc,
+                alpha_td=alpha_td
+            )
+
+            for method, alpha, errors in [
+                ("MC", alpha_mc, mc_errors),
+                ("TD", alpha_td, td_errors)
+            ]:
+                final_rmse = float(errors[-1])
+                final_errors[method].append(final_rmse)
+
+                seed_rows.append({
+                    "method": method,
+                    "alpha_0": alpha,
+                    "training_seed": seed,
+                    "final_validation_rmse": final_rmse
+                })
+
+        for method, alpha in [("MC", alpha_mc), ("TD", alpha_td)]:
+
+            mean = float(np.mean(final_errors[method]))
+            sd = float(np.std(final_errors[method]))
+
+            summary_rows.append({
+                "method": method,
+                "alpha_0": alpha,
+                "mean_final_validation_rmse": mean,
+                "sd_across_training_seeds": sd
+            })
+
+            print(f"{method} alpha0={alpha:g}: {mean:.3f} +/- {sd:.3f}")
+
+    # Group each table by method, retaining the candidate order above.
+    summary_rows.sort(key=lambda row: row["method"])
+    seed_rows.sort(key=lambda row: row["method"])
+
+    for filename, rows in [
+        ("summary.csv", summary_rows),
+        ("per_seed_results.csv", seed_rows)
+    ]:
+        with (output_dir / filename).open("w", newline="", encoding="utf-8") as file:
+
+            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    print(f"Saved comparison results in {output_dir.resolve()}")
+
+
+def evaluate_test_set(
+    n_games: int = 2000,
+    seed: int = 2031,
+    weights_path: str | Path | None = None,
+) -> None:
+    """Evaluate saved predictors and save a CSV summary of independent-test RMSE.
+
+    By default, load prediction_weights.npz from the prediction folder. Supply
+    weights_path if the saved weights are in another folder.
+    """
+    if n_games < 1:
+        raise ValueError("n_games must be positive.")
+
+    weights_path = (
+        OUTPUT_DIR / "prediction_weights.npz"
+        if weights_path is None
+        else Path(weights_path)
+    )
+
+    # Load before simulation so a missing file is reported immediately.
+    with np.load(weights_path) as weights:
+        trained_weights = {
+            "Monte Carlo": weights["theta_mc"],
+            "TD(0)": weights["theta_td"],
+        }
+
+    # The data generator uses the same fixed policy with a fresh seed.
+    X_test, y_test = validation_data(n_games=n_games, seed=seed)
+
+    print(f"Independent test set: {n_games} games; seed={seed}")
+
+    baseline_rmse = float(np.sqrt(np.mean((100.0 - y_test) ** 2)))
+    print(f"Constant-100 test RMSE: {baseline_rmse:.3f}")
+
+    summary_rows = []
+
+    for name, weights in trained_weights.items():
+        errors = np.array([
+            prediction_rmse(theta, X_test, y_test)
+            for theta in weights
+        ])
+
+        print(f"\n{name}:")
+        for index, error in enumerate(errors):
+            print(f"  Saved training run {index + 1}: {error:.3f}")
+
+        print(
+            f"  Mean test RMSE: {errors.mean():.3f} "
+            f"± {errors.std():.3f} (SD across training seeds)"
+        )
+
+        summary_rows.append({
+            "method": name,
+            "mean_test_rmse": float(errors.mean()),
+            "sd_across_training_seeds": float(errors.std()),
+            "training_runs": len(errors),
+            "test_games": n_games,
+            "test_seed": seed
+        })
+
+    # The constant predictor has no training runs or across-seed variation.
+    summary_rows.append({
+        "method": "Constant-100",
+        "mean_test_rmse": baseline_rmse,
+        "sd_across_training_seeds": "",
+        "training_runs": 0,
+        "test_games": n_games,
+        "test_seed": seed
+    })
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    summary_path = OUTPUT_DIR / "prediction_test_summary.csv"
+
+    with summary_path.open("w", newline="", encoding="utf-8") as file:
+
+        writer = csv.DictWriter(file, fieldnames=list(summary_rows[0]))
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    print(f"Saved test summary: {summary_path.resolve()}")
+
+
 if __name__ == "__main__":
-    run_experiment()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Prediction experiments")
+    parser.add_argument("--compare-rates", action="store_true",
+                        help="Run the targeted learning-rate comparison and export CSVs.")
+    args = parser.parse_args()
+    if args.compare_rates:
+        compare_learning_rates()
+    else:
+        run_experiment()
+        evaluate_test_set()
 

@@ -4,7 +4,7 @@
 
 RUN_EXPERIMENTS = False (default): trains only the final agent (finite-horizon
 LSPI against the default opponent, about 5 minutes on one CPU core) and writes
-rlagent/agentx_theta.npy. This is far below the 40 Colab compute-unit budget.
+rlagent/agentE_theta.npy. This is far below the 40 Colab compute-unit budget.
 
 RUN_EXPERIMENTS = True: also reproduces every number, figure and table of the
 2.4 write-up in refine_results/ (about 80 minutes on a 2-core CPU): extra
@@ -25,7 +25,7 @@ import numpy as np
 RUN_EXPERIMENTS = False
 
 OUT = Path("refine_results")
-AGENT_FILE = Path("rlagent") / "agentx_theta.npy"
+AGENT_FILE = Path("rlagent") / "agentE_theta.npy"
 
 # ---------------------------------------------------------------------------
 # Tuning parameters (Table table_2_4_tuning.csv)

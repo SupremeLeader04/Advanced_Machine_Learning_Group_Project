@@ -12,9 +12,13 @@ from features import feasible_actions, state_action_features, state_features
 
 FEATURE_SIZES = {"baseline": 150, "quadratic": 300}
 
+CURVE_VALIDATION_SEED = 9000
+SELECTION_VALIDATION_SEED = 10000
+FINAL_TEST_SEED = 20000
 
+# learning rate for control (MC and SARSA weight updates)
 def learning_rate(
-    episode: int,
+    episode: int, # current training episode
     alpha_0: float,
     decay_scale: float = 750.0,
     exponent: float = 0.6
@@ -38,31 +42,41 @@ def exploration_rate(
         epsilon_0 / (1.0 + episode / decay_scale) ** exponent
     )
 
-
+# this converts (delta, x) into the 2 spending fractions used by the feature representation
 def action_fractions(
     state: list,
     actions: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return normalised speed spending u and absolute trading exposure v."""
+    """Return speed-spending and trading-exposure fractions for each action."""
 
     budget = float(state[1])
-    actions = np.asarray(actions, dtype=float).reshape(-1, 2)
 
-    speed_cost = actions[:, 0] ** 2
-    wealth = np.maximum(0.0, budget - speed_cost)
+    # Each row contains one action: (speed investment, trading position).
+    actions = np.asarray(actions, dtype=float).reshape(-1, 2) # converts into a matrix with 2 rows, and the -1 tells it to automatically find row num
 
-    u = speed_cost / budget if budget > 0 else np.zeros(len(actions))
+    speed_investments = actions[:, 0] # select every row in respective column index 
+    trading_positions = actions[:, 1]
 
-    v = np.divide(
-        np.abs(actions[:, 1]),
-        wealth,
-        out=np.zeros(len(actions)),
-        where=wealth > 0
+    speed_costs = speed_investments ** 2 # total invested into speed so this equals delta squared
+    remaining_wealth = np.maximum(0.0, budget - speed_costs)
+
+    # Start at zero so actions with no available budget remain well-defined.
+    speed_fractions = np.zeros(len(actions))
+    trading_fractions = np.zeros(len(actions))
+
+    if budget > 0:
+        speed_fractions = speed_costs / budget
+
+    # Only divide where some wealth remains after speed investment.
+    can_trade = remaining_wealth > 0
+
+    trading_fractions[can_trade] = (
+        np.abs(trading_positions[can_trade]) / remaining_wealth[can_trade]
     )
 
-    return u, v
+    return speed_fractions, trading_fractions
 
-
+# Selects which feature representation to use for a particular state and action
 def encode_action(
     state: list,
     action: list | tuple,
@@ -71,13 +85,14 @@ def encode_action(
     """Features for the chosen action."""
 
     if features == "baseline":
-        return state_action_features(state, action).astype(float)
+        return state_action_features(state, action).astype(float) # returns the original 150 element vector
 
     if features != "quadratic":
         raise ValueError("features must be 'baseline' or 'quadratic'.")
 
-    z = state_features(state).astype(float)
+    z = state_features(state).astype(float) # sets z as the 150 element vector
 
+    # encodes u and v as arrays which have a certain speed fraction or trading fraction respectively
     u, v = action_fractions(
         state,
         np.asarray([action], dtype=float)
@@ -87,20 +102,20 @@ def encode_action(
 
     # Retains all original features and adds curvature and an action interaction.
     return np.concatenate([
-        z,
-        u * z,
-        v * z,
-        u * u * z,
-        v * v * z,
-        u * v * z
-    ])
+        z, #50 features vector (one hot)
+        u * z, # Scaled by speed fraction
+        v * z, #speed by trading fraction
+        u * u * z,#scaled by speed fraction squared
+        v * v * z,# scaled by trading fraction squared
+        u * v * z # scaled by both
+    ]) # this returns a 300 dimensional flat array
 
-
+# predicts the final wealth associated with every supplied action in the current state
 def action_values(
     state: list,
-    actions: list,
-    theta: np.ndarray,
-    features: str
+    actions: list, 
+    theta: np.ndarray, # weights vector
+    features: str # whether to use quadratic or linear features
 ) -> np.ndarray:
     """
     Score all feasible actions without building 111 full feature vectors.
@@ -108,21 +123,22 @@ def action_values(
     Q(s,a) = theta.T @ phi(s,a); coefficients depend on the current state.
     This vectorised calculation is identical to scoring each action separately.
     """
-
+    # the weights must match the chosen representation
     if features not in FEATURE_SIZES:
         raise ValueError("Unknown feature representation.")
 
     if theta.shape != (FEATURE_SIZES[features],):
         raise ValueError("Incorrect parameter vector length.")
 
-    z = state_features(state).astype(float)
+    z = state_features(state).astype(float) # one vector with 50 indicators
 
-    coefficients = theta.reshape(-1, 50) @ z
+    coefficients = theta.reshape(-1, 50) @ z  # this reshapes theta so that it containrs 3 blocks of 50 weights
+    # this is then multiplied by z to get the 3 dot
 
     u, v = action_fractions(
         state,
         np.asarray(actions, dtype=float)
-    )
+    ) # sets ui and v as the repsective speed and trading fractions
 
     q = coefficients[0] + coefficients[1] * u + coefficients[2] * v
 
@@ -155,11 +171,13 @@ def choose_action(
     Random tie-breaking during training prevents an initially all-zero Q
     function from always selecting the first grid action.
     """
-
+    # conduct checks to ensure epsilon is feasible
     if not 0.0 <= epsilon <= 1.0:
         raise ValueError("epsilon must be in [0, 1].")
 
+    # get the list of all of the feasible actions with tuples (delta, x) inside
     actions = feasible_actions(state)
+
 
     if epsilon > 0 and np.random.random() < epsilon:
         index = int(np.random.randint(len(actions)))
@@ -167,7 +185,7 @@ def choose_action(
     else:
         q = action_values(state, actions, theta, features)
         best = np.flatnonzero(q == np.max(q))
-
+        # handling if there are ties
         index = (
             int(np.random.choice(best))
             if random_ties
@@ -180,10 +198,10 @@ def choose_action(
 
 
 def mc_update(
-    theta: np.ndarray,
-    trajectory: list[np.ndarray],
-    terminal_budget: float,
-    alpha: float
+    theta: np.ndarray, # current learned weights
+    trajectory: list[np.ndarray], # feature cevtors for all state-action pairs visited during an episode
+    terminal_budget: float, # firm 1s final budget
+    alpha: float # learning rate
 ) -> None:
     """Every-visit on-policy Monte Carlo control."""
 
@@ -202,9 +220,9 @@ def sarsa_update(
 ) -> None:
     """On-policy one-step TD update with the *actually chosen* next action."""
 
-    prediction = float(theta @ phi)
+    prediction = float(theta @ phi) # calculates prediction
 
-    if terminal_budget is not None:
+    if terminal_budget is not None: # are we in the terminal budget or not
         target = float(terminal_budget)
 
     else:
@@ -213,7 +231,7 @@ def sarsa_update(
                 "A next action feature vector is required before termination."
             )
 
-        target = float(theta @ next_phi)
+        target = float(theta @ next_phi) # we need the next state action value
 
     theta += alpha * (target - prediction) * phi
 
@@ -324,7 +342,7 @@ class GreedyAgent:
 
         return action
 
-
+# how well does a trained control agent perform against a default opponent over multiple simulated games, simply performance measure
 def evaluate_policy(
     theta: np.ndarray | None,
     features: str,
@@ -338,7 +356,7 @@ def evaluate_policy(
     changes the sequence of subsequent training episodes.
     """
 
-    saved_rng = np.random.get_state()
+    saved_rng = np.random.get_state() #prevents evaluation from consuming random numbers which may be used for later training
 
     try:
         np.random.seed(seed)
@@ -351,7 +369,7 @@ def evaluate_policy(
 
         own, opponent = [], []
 
-        for _ in range(n_games):
+        for _ in range(n_games): # for each game, runs for 10 periods, uses firm 1s selected policy, firm2 default
             history = sim_game(
                 n=10,
                 policy_1=firm_1,
@@ -361,28 +379,29 @@ def evaluate_policy(
             own.append(float(history[-1, 1]))
             opponent.append(float(history[-1, 2]))
 
-    finally:
+    finally: #executes even if there is an error during evaluation
         np.random.set_state(saved_rng)
 
+    # covert them into arrays
     own = np.asarray(own)
     opponent = np.asarray(opponent)
 
     return {
-        "mean": float(np.mean(own)),
+        "mean": float(np.mean(own)), #mean terminal wealth
         "median": float(np.median(own)),
         "se": (
             float(np.std(own, ddof=1) / np.sqrt(n_games))
             if n_games > 1
             else 0.0
-        ),
-        "win_rate": float(np.mean(own > opponent)),
-        "mean_difference": float(np.mean(own - opponent)),
+        ), #standard error
+        "win_rate": float(np.mean(own > opponent)), #prop games firm 1 finishes wealthier
+        "mean_difference": float(np.mean(own - opponent)), 
         "own": own,
         "opponent": opponent,
     }
 
 
-def train_control(
+def train_control( #the main training function for control
     method: str,
     features: str,
     n_episodes: int,
@@ -391,7 +410,7 @@ def train_control(
     n_eval_games: int,
     alpha_0: float,
     epsilon_0: float = 0.30,
-    reward_shift: float = 0.0
+    reward_shift: float = 0.0 #changes whether algo learns terminakl wealth or profit relative to 100
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Trains an MC or SARSA agent against the default opponent.
@@ -412,7 +431,7 @@ def train_control(
 
     checkpoints = [0]
     curve = [
-        evaluate_policy(theta, features, n_eval_games, seed=9000)["mean"]
+        evaluate_policy(theta, features, n_eval_games, seed=CURVE_VALIDATION_SEED)["mean"]
     ]
 
     for episode in range(1, n_episodes + 1):
@@ -452,7 +471,7 @@ def train_control(
                 theta,
                 features,
                 n_eval_games,
-                seed=9000
+                seed=CURVE_VALIDATION_SEED
             )
 
             checkpoints.append(episode)
@@ -521,7 +540,7 @@ def sample_strategy(
     return samples
 
 
-def mean_by_group(
+def mean_by_group( #divide obs into groups and calculate the average value of a chosen variable within each group
     samples: list[dict],
     key: str,
     indices: np.ndarray,
@@ -529,7 +548,7 @@ def mean_by_group(
 ) -> np.ndarray:
     """Group mean, using NaN for bins without observations."""
 
-    values = np.asarray([row[key] for row in samples])
+    values = np.asarray([row[key] for row in samples]) #extract the variable we are interested in
     result = np.full(n_groups, np.nan)
 
     for group in range(n_groups):
@@ -622,19 +641,180 @@ def plot_strategy(
     plt.close(fig)
 
 
+def _evaluate_candidates(
+    candidates: dict,
+    n_games: int,
+    seed: int,
+    output_dir: Path,
+    split: str
+) -> None:
+    """Report per-policy SE and across-training-seed SD as separate quantities."""
+
+    rows = []
+
+    # The default policy needs no learned feature representation or weights.
+    policies = [("Default", "", "baseline", "", None, "")]
+
+    for method, candidate in candidates.items():
+        for training_seed, theta in zip(candidate["training_seeds"], candidate["weights"]):
+            policies.append((
+                method,
+                int(training_seed),
+                candidate["features"],
+                candidate["alpha_0"],
+                theta,
+                candidate["weights_file"]
+            ))
+
+    print(f"\n{split.capitalize()} evaluation: {n_games} games, seed={seed}")
+
+    for method, training_seed, features, alpha, theta, weights_file in policies:
+        result = evaluate_policy(theta, features, n_games, seed)
+
+        rows.append({
+            "method": method,
+            "training_seed": training_seed,
+            "features": features if theta is not None else "",
+            "alpha_0": alpha,
+            "split": split,
+            "evaluation_games": n_games,
+            "evaluation_seed": seed,
+            "mean_budget": result["mean"],
+            "budget_se": result["se"],
+            "median_budget": result["median"],
+            "win_rate": result["win_rate"],
+            "mean_difference": result["mean_difference"],
+            "weights_file": weights_file
+        })
+
+        print(
+            f"  {method} seed={training_seed}: mean B10={result['mean']:.2f} "
+            f"+/- {result['se']:.2f} (SE over evaluation games)",
+            flush=True
+        )
+
+    summaries = []
+
+    for method in ["Default", *candidates]:
+        selected = [row for row in rows if row["method"] == method]
+        means = np.array([row["mean_budget"] for row in selected])
+        sd = float(means.std()) if method != "Default" else ""
+
+        summaries.append({
+            "method": method,
+            "features": selected[0]["features"],
+            "alpha_0": selected[0]["alpha_0"],
+            "split": split,
+            "evaluation_games": n_games,
+            "evaluation_seed": seed,
+            "training_runs": len(selected) if method != "Default" else 0,
+            "mean_budget": float(means.mean()),
+            "sd_across_training_seeds": sd
+        })
+
+        if method != "Default":
+            print(
+                f"  {method}: mean B10={means.mean():.2f} +/- {sd:.2f} "
+                "(SD across training seeds, not an evaluation SE)"
+            )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for filename, data in [
+        (f"{split}_evaluation.csv", rows),
+        (f"{split}_summary.csv", summaries)
+    ]:
+        with (output_dir / filename).open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=list(data[0]))
+            writer.writeheader()
+            writer.writerows(data)
+
+
+def evaluate_final_test(
+    mc_weights_path: str | Path,
+    sarsa_weights_path: str | Path | None = None,
+    n_games: int = 2000,
+    seed: int = FINAL_TEST_SEED,
+    output_dir: str | Path = Path("control_results") / "final_test"
+) -> None:
+    """Test selected saved configurations only, without training or selection.
+
+    Supply separate archives if MC and SARSA were selected from different
+    learning-rate or feature experiments. Each archive contains all training seeds.
+    """
+
+    if n_games < 1:
+        raise ValueError("n_games must be positive.")
+
+    if seed in (CURVE_VALIDATION_SEED, SELECTION_VALIDATION_SEED):
+        raise ValueError("Final testing must use a different seed from validation.")
+
+    if sarsa_weights_path is None:
+        sarsa_weights_path = mc_weights_path
+
+    candidates = {}
+
+    for method, key, path in [
+        ("MC", "mc", mc_weights_path),
+        ("SARSA", "sarsa", sarsa_weights_path)
+    ]:
+        with np.load(path) as saved:
+            required = {key, "features", "training_seeds", f"alpha_{key}"}
+
+            if not required.issubset(saved.files):
+                raise ValueError(
+                    f"{path} lacks experiment metadata. Use an archive saved "
+                    "by the updated run_experiment()."
+                )
+
+            features = str(saved["features"].item())
+            training_seeds = saved["training_seeds"]
+            weights = saved[key]
+
+            if features not in FEATURE_SIZES or weights.shape != (
+                len(training_seeds), FEATURE_SIZES[features]
+            ):
+                raise ValueError(f"Invalid feature representation or weight shape in {path}.")
+
+            if seed in training_seeds:
+                raise ValueError("Final testing must use a different seed from training.")
+
+            candidates[method] = {
+                "weights": weights,
+                "features": features,
+                "training_seeds": training_seeds,
+                "alpha_0": float(saved[f"alpha_{key}"]),
+                "weights_file": str(Path(path).resolve())
+            }
+
+    _evaluate_candidates(candidates, n_games, seed, Path(output_dir), split="test")
+    print(f"Saved final-test results in {Path(output_dir).resolve()}")
+
+
 def run_experiment(
     features: str = "baseline",
     n_episodes: int = 3000,
     n_seeds: int = 3,
     evaluate_every: int = 300,
-    n_eval_games: int = 100,
-    n_test_games: int = 400,
-    reward_shift: float = 0.0
+    n_eval_games: int = 200,
+    n_validation_games: int = 1000,
+    reward_shift: float = 0.0,
+    alpha_mc: float = 0.001,
+    alpha_sarsa: float = 0.005,
+    output_dir: str | Path | None = None,
+    make_strategy_plots: bool = False,
+    make_learning_curve_plot: bool = True
 ) -> None:
-    """Trains, evaluates and compares MC and SARSA control."""
+    """Train candidates and report validation only; never run final testing."""
 
     if features not in FEATURE_SIZES:
         raise ValueError("features must be 'baseline' or 'quadratic'.")
+
+    if min(n_episodes, n_seeds, evaluate_every, n_eval_games, n_validation_games) < 1:
+        raise ValueError("Episode, seed, interval and evaluation counts must be positive.")
+
+    if not all(np.isfinite(alpha) and alpha > 0 for alpha in (alpha_mc, alpha_sarsa)):
+        raise ValueError("Initial learning rates must be finite and positive.")
 
     reward_name = (
         "wealth"
@@ -642,34 +822,36 @@ def run_experiment(
         else f"shift_{reward_shift:g}"
     )
 
-    output_dir = Path("control_results") / f"{features}_{reward_name}"
+    output_dir = Path(output_dir) if output_dir is not None else (
+        Path("control_results")
+        / f"{features}_{reward_name}_mc{alpha_mc:g}_sarsa{alpha_sarsa:g}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Starting choices from prediction; tune them for control after first run.
-    alpha_settings = {"MC": 0.001, "SARSA": 0.005}
+    alpha_settings = {"MC": alpha_mc, "SARSA": alpha_sarsa}
 
     print(f"Features: {features} ({FEATURE_SIZES[features]} parameters)")
     print(f"Training episodes per method/seed: {n_episodes}; seeds: {n_seeds}")
     print(f"Learning-rate alpha0: {alpha_settings}")
+    print(f"Checkpoint validation: {n_eval_games} games, seed={CURVE_VALIDATION_SEED}")
+    print(f"Candidate validation: {n_validation_games} games, seed={SELECTION_VALIDATION_SEED}")
     print("Exploration: max(0.05, 0.30 / (1 + episode/750)^0.8)")
 
     all_weights = {"MC": [], "SARSA": []}
     all_curves = {"MC": [], "SARSA": []}
-    final_rows = []
+    training_seeds = np.arange(123, 123 + n_seeds)
 
-    # Common evaluation seeds make the methods' comparisons less noisy.
-    final_eval_seed = 12000
-
-    default = evaluate_policy(
+    # Match the benchmark to the games used for the checkpoint curves.
+    default_curve = evaluate_policy(
         None,
         features,
-        n_test_games,
-        final_eval_seed
+        n_eval_games,
+        CURVE_VALIDATION_SEED
     )
 
     print(
-        f"Default vs default: mean B10={default['mean']:.2f}, "
-        f"win rate={default['win_rate']:.1%}",
+        f"Checkpoint default: mean B10={default_curve['mean']:.2f} "
+        f"+/- {default_curve['se']:.2f} (SE)",
         flush=True
     )
 
@@ -691,169 +873,97 @@ def run_experiment(
             all_weights[method].append(theta)
             all_curves[method].append(curve)
 
-            test = evaluate_policy(
-                theta,
-                features,
-                n_test_games,
-                final_eval_seed
-            )
+    if make_learning_curve_plot:
+        # Plot greedy-policy validation performance during learning.
+        fig, ax = plt.subplots(figsize=(9, 5))
 
-            final_rows.append({
-                "method": method,
-                "seed": seed,
-                "mean_budget": test["mean"],
-                "median_budget": test["median"],
-                "budget_se": test["se"],
-                "win_rate": test["win_rate"],
-                "mean_difference": test["mean_difference"],
-            })
+        for method in ("MC", "SARSA"):
+            curves = np.asarray(all_curves[method])
 
-            print(
-                f"  Held-out {method:5} seed={seed}: "
-                f"mean B10={test['mean']:.2f} ± {test['se']:.2f} (SE), "
-                f"win rate={test['win_rate']:.1%}",
-                flush=True
-            )
+            mean = curves.mean(axis=0)
+            sd = curves.std(axis=0)
 
-    # Plot greedy-policy validation performance during learning.
-    fig, ax = plt.subplots(figsize=(9, 5))
-
-    for method in ("MC", "SARSA"):
-        curves = np.asarray(all_curves[method])
-
-        mean = curves.mean(axis=0)
-        sd = curves.std(axis=0)
-
-        line, = ax.plot(
-            checkpoints,
-            mean,
-            label=method
-        )
-
-        if n_seeds > 1:
-            ax.fill_between(
+            line, = ax.plot(
                 checkpoints,
-                mean - sd,
-                mean + sd,
-                color=line.get_color(),
-                alpha=0.18
+                mean,
+                label=method
             )
 
-    ax.axhline(
-        default["mean"],
-        linestyle="--",
-        color="grey",
-        label="Default vs default (evaluation reference)"
-    )
+            if n_seeds > 1:
+                ax.fill_between(
+                    checkpoints,
+                    mean - sd,
+                    mean + sd,
+                    color=line.get_color(),
+                    alpha=0.18
+                )
 
-    # Doing nothing always preserves the initial 100; this is a key sanity benchmark.
-    ax.axhline(
-        100.0,
-        linestyle=":",
-        color="black",
-        label="Hold cash: B10 = 100"
-    )
-
-    ax.set(
-        xlabel="Training episodes",
-        ylabel="Mean greedy-policy terminal budget",
-        title=f"Control performance against default ({features})"
-    )
-
-    ax.legend()
-    ax.grid(alpha=0.25)
-
-    fig.tight_layout()
-    fig.savefig(
-        output_dir / "control_learning_curves.png",
-        dpi=200
-    )
-    plt.close(fig)
-
-    # Document the exact exploration and step-size schedules.
-    episodes = np.arange(1, n_episodes + 1)
-
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-
-    axes[0].plot(
-        episodes,
-        [exploration_rate(int(e)) for e in episodes]
-    )
-
-    axes[0].set(
-        xlabel="Training episode",
-        ylabel="epsilon",
-        title="Decreasing exploration rate"
-    )
-
-    for method, alpha_0 in alpha_settings.items():
-        axes[1].plot(
-            episodes,
-            [learning_rate(int(e), alpha_0) for e in episodes],
-            label=method
+        ax.axhline(
+            default_curve["mean"],
+            linestyle="--",
+            color="grey",
+            label="Default vs default (same checkpoint validation settings)"
         )
 
-    axes[1].set(
-        xlabel="Training episode",
-        ylabel="alpha",
-        title="Decreasing learning rates"
-    )
+        # Doing nothing always preserves the initial 100; this is a key sanity benchmark.
+        ax.axhline(
+            100.0,
+            linestyle=":",
+            color="black",
+            label="Hold cash: B10 = 100"
+        )
 
-    axes[1].legend()
+        ax.set(
+            xlabel="Training episodes",
+            ylabel="Mean greedy-policy validation terminal budget",
+            title=f"Control validation learning curves ({features})"
+        )
 
-    for ax in axes:
+        ax.legend()
         ax.grid(alpha=0.25)
 
-    fig.tight_layout()
-    fig.savefig(
-        output_dir / "control_schedules.png",
-        dpi=200
-    )
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(
+            output_dir / "control_learning_curves.png",
+            dpi=200
+        )
+        plt.close(fig)
 
-    # Inspect the greedy policies from the final training seed.
-    mc_samples = sample_strategy(
-        all_weights["MC"][-1],
-        features,
-        100,
-        seed=14000
-    )
-
-    td_samples = sample_strategy(
-        all_weights["SARSA"][-1],
-        features,
-        100,
-        seed=14000
-    )
-
-    plot_strategy(mc_samples, td_samples, output_dir)
-
-    with (output_dir / "strategy_samples.csv").open("w", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=["method"] + list(mc_samples[0])
+    if make_strategy_plots:
+        # Inspect the greedy policies from the final training seed.
+        mc_samples = sample_strategy(
+            all_weights["MC"][-1],
+            features,
+            100,
+            seed=14000
         )
 
-        writer.writeheader()
-
-        for method, samples in [
-            ("MC", mc_samples),
-            ("SARSA", td_samples)
-        ]:
-            for sample in samples:
-                writer.writerow({
-                    "method": method,
-                    **sample
-                })
-
-    with (output_dir / "final_evaluation.csv").open("w", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=list(final_rows[0])
+        td_samples = sample_strategy(
+            all_weights["SARSA"][-1],
+            features,
+            100,
+            seed=14000
         )
 
-        writer.writeheader()
-        writer.writerows(final_rows)
+        plot_strategy(mc_samples, td_samples, output_dir)
+
+        with (output_dir / "strategy_samples.csv").open("w", newline="") as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=["method"] + list(mc_samples[0])
+            )
+
+            writer.writeheader()
+
+            for method, samples in [
+                ("MC", mc_samples),
+                ("SARSA", td_samples)
+            ]:
+                for sample in samples:
+                    writer.writerow({
+                        "method": method,
+                        **sample
+                    })
 
     with (output_dir / "schedules.csv").open("w", newline="") as file:
         writer = csv.writer(file)
@@ -865,7 +975,7 @@ def run_experiment(
             "alpha_sarsa"
         ])
 
-        for episode in episodes:
+        for episode in range(1, n_episodes + 1):
             writer.writerow([
                 int(episode),
                 exploration_rate(int(episode)),
@@ -885,49 +995,176 @@ def run_experiment(
         sarsa=np.stack(all_weights["SARSA"]),
         checkpoints=checkpoints,
         mc_validation=np.stack(all_curves["MC"]),
-        sarsa_validation=np.stack(all_curves["SARSA"])
+        sarsa_validation=np.stack(all_curves["SARSA"]),
+        features=features,
+        training_seeds=training_seeds,
+        alpha_mc=alpha_mc,
+        alpha_sarsa=alpha_sarsa,
+        n_episodes=n_episodes,
+        reward_shift=reward_shift,
+        curve_validation_games=n_eval_games,
+        curve_validation_seed=CURVE_VALIDATION_SEED,
+        selection_validation_games=n_validation_games,
+        selection_validation_seed=SELECTION_VALIDATION_SEED,
+        default_curve_mean=default_curve["mean"],
+        default_curve_se=default_curve["se"]
     )
 
-    print("\nHeld-out performance (mean over independent training seeds):")
+    candidates = {
+        method: {
+            "weights": np.stack(all_weights[method]),
+            "features": features,
+            "training_seeds": training_seeds,
+            "alpha_0": alpha_settings[method],
+            "weights_file": str((output_dir / "trained_weights.npz").resolve())
+        }
+        for method in ("MC", "SARSA")
+    }
 
-    print(
-        f"Default firm 1: B10={default['mean']:.2f} "
-        f"± {default['se']:.2f} (SE)"
+    _evaluate_candidates(
+        candidates, n_validation_games, SELECTION_VALIDATION_SEED,
+        output_dir, split="validation"
     )
-
-    print("Hold-cash policy: B10=100.00 (certain, no speed or trade)")
-
-    for method in ("MC", "SARSA"):
-        values = np.array([
-            row["mean_budget"]
-            for row in final_rows
-            if row["method"] == method
-        ])
-
-        wins = np.array([
-            row["win_rate"]
-            for row in final_rows
-            if row["method"] == method
-        ])
-
-        print(
-            f"{method:5}: B10={values.mean():.2f} "
-            f"± {values.std():.2f} "
-            f"(SD across seeds), win rate={wins.mean():.1%}"
-        )
 
     print(
         f"\nSaved figures, CSVs and weights in: {output_dir.resolve()}"
     )
 
 
+def run_learning_rate_sensitivity(
+    n_episodes: int = 3000,
+    n_seeds: int = 3,
+    evaluate_every: int = 300,
+    n_eval_games: int = 200,
+    n_validation_games: int = 1000,
+    output_dir: str | Path = Path("control_results") / "learning_rate_sensitivity"
+) -> None:
+    """Compare initial rates on baseline features without using final-test games.
+
+    The consolidated CSV has one row per method/rate/training seed, with
+    the candidate's mean and SD repeated alongside individual seed results.
+    Its statistics use final candidate validation; plots use checkpoint validation.
+    """
+
+    # Figures are saved to disk; no interactive plotting window is needed.
+    plt.switch_backend("Agg")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    learning_rates = [0.001, 0.0025, 0.005]
+    consolidated_rows = []
+    learning_curves = {"MC": [], "SARSA": []}
+
+    for rate_index, alpha_0 in enumerate(learning_rates):
+
+        candidate_dir = output_dir / f"alpha_{alpha_0:g}"
+
+        # Reuse training, validation, benchmark evaluation and weight exports.
+        run_experiment(
+            features="baseline",
+            n_episodes=n_episodes,
+            n_seeds=n_seeds,
+            evaluate_every=evaluate_every,
+            n_eval_games=n_eval_games,
+            n_validation_games=n_validation_games,
+            alpha_mc=alpha_0,
+            alpha_sarsa=alpha_0,
+            reward_shift=0.0,
+            output_dir=candidate_dir,
+            make_strategy_plots=False,
+            make_learning_curve_plot=False
+        )
+
+        with (candidate_dir / "validation_evaluation.csv").open(
+            newline="", encoding="utf-8"
+        ) as file:
+            rows = list(csv.DictReader(file))
+
+        # The same default benchmark is repeated by each experiment; keep it once.
+        if rate_index == 0:
+            benchmark = next(row for row in rows if row["method"] == "Default")
+            consolidated_rows.append({
+                **benchmark,
+                "mean_across_training_seeds": benchmark["mean_budget"],
+                "sd_across_training_seeds": ""
+            })
+
+        for method in ("MC", "SARSA"):
+
+            selected = [row for row in rows if row["method"] == method]
+            means = np.array([float(row["mean_budget"]) for row in selected])
+
+            for row in selected:
+                consolidated_rows.append({
+                    **row,
+                    "mean_across_training_seeds": float(means.mean()),
+                    "sd_across_training_seeds": float(means.std())
+                })
+
+        with np.load(candidate_dir / "trained_weights.npz") as saved:
+            checkpoints = saved["checkpoints"]
+            default_curve_mean = float(saved["default_curve_mean"])
+            learning_curves["MC"].append(saved["mc_validation"])
+            learning_curves["SARSA"].append(saved["sarsa_validation"])
+
+    with (output_dir / "learning_rate_sensitivity.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=list(consolidated_rows[0]))
+        writer.writeheader()
+        writer.writerows(consolidated_rows)
+
+    for method in ("MC", "SARSA"):
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        for alpha_0, curves in zip(learning_rates, learning_curves[method]):
+            mean = curves.mean(axis=0)
+            sd = curves.std(axis=0)
+
+            line, = ax.plot(checkpoints, mean, label=f"alpha0 = {alpha_0:g}")
+            ax.fill_between(
+                checkpoints, mean - sd, mean + sd,
+                color=line.get_color(), alpha=0.2
+            )
+
+        ax.axhline(default_curve_mean, linestyle="--", color="grey",
+                   label="Default vs default (checkpoint validation)")
+        ax.axhline(100.0, linestyle=":", color="black", label="Hold cash = 100")
+
+        ax.set(
+            xlabel="Training episodes",
+            ylabel="Mean validation terminal wealth",
+            title=f"{method}: learning-rate sensitivity\n"
+                  f"{n_eval_games} validation games per checkpoint (seed {CURVE_VALIDATION_SEED})"
+        )
+        ax.legend()
+        ax.grid(alpha=0.25)
+
+        fig.text(
+            0.5, 0.02,
+            f"Shading: +/- 1 SD across {n_seeds} training seeds, not a confidence interval.",
+            ha="center", fontsize=9
+        )
+        fig.tight_layout(rect=(0, 0.05, 1, 1))
+        fig.savefig(output_dir / f"{method.lower()}_learning_rate_sensitivity.png", dpi=200)
+        plt.close(fig)
+
+    print(f"\nSaved consolidated validation results and sensitivity plots in: {output_dir.resolve()}")
+
+
 if __name__ == "__main__":
-    run_experiment(
-        features="baseline",
-        n_episodes=3000,
-        n_seeds=3,
-        evaluate_every=300,
-        n_eval_games=100,
-        n_test_games=400,
-        reward_shift=0.0
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Control validation experiments")
+    parser.add_argument(
+        "--learning-rate-sensitivity", action="store_true",
+        help="Compare initial learning rates for baseline MC and SARSA using validation only."
     )
+    args = parser.parse_args()
+
+    if args.learning_rate_sensitivity:
+        run_learning_rate_sensitivity()
+    else:
+        run_experiment()

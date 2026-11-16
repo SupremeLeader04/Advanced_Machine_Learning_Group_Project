@@ -22,6 +22,7 @@ _THETA = np.load(Path(__file__).resolve().parent / "agentE_theta.npy")   # (10, 
 
 SIGMA = 1.5   # s.d. of the price move
 T = 10        # number of periods
+MAX_EFFECTIVE_SPEED = 350.0
 
 # Action grid: speed spend u = delta^2 / B (finer at small values) and
 # trade share v = |x| / W of post-cost wealth; trade direction = sign(g).
@@ -84,10 +85,14 @@ def _p_win(delta, S_self, S_opp, opp_scale):
     return (1 / (1 + np.exp(-np.clip(z, -50, 50)))).mean(axis=1)
 
 
+def _speed_investment(B_self, S_self, fraction):
+    return np.minimum(np.sqrt(fraction * B_self), max(MAX_EFFECTIVE_SPEED - S_self, 0.0))
+
+
 def _action_terms(B_self, B_opp, S_self, S_opp, g, R):
     """The 6 action terms h(s, a) for all 176 grid actions (see refine.py)."""
-    delta = np.sqrt(U_GRID * B_self)                 # speed investment of each action
-    kept = 1 - U_GRID                                # wealth share left after speed cost
+    delta = _speed_investment(B_self, S_self, U_GRID)
+    kept = 1 - delta**2 / B_self
     gains = np.array([_trade_gain(g, R, f) for f in TRADE_FRACS])
     gv = gains[np.round(V_GRID * 10).astype(int)]
     p_def = _p_win(delta, S_self, S_opp, sqrt(B_opp))   # vs a default-like opponent
@@ -109,12 +114,12 @@ def policy(t, B_self, B_opp, S_self, S_opp, g, R):
     # Q-value per unit of wealth for every action: z' Theta_t h(a); pick the best
     q = h @ (z @ _THETA[t_idx].reshape(N_Z, N_H))
     k = int(np.argmax(q))
-    delta = float(np.sqrt(U_GRID[k] * B_self))
-    W = B_self - delta**2
-    x = float(np.sign(g) * V_GRID[k] * W)
+    delta = float(_speed_investment(B_self, S_self, U_GRID[k]))
     # guard against floating-point overspending (delta^2 + |x| <= B)
     while delta**2 > B_self:
         delta = float(np.nextafter(delta, 0.0))
+    W = B_self - delta**2
+    x = float(np.sign(g) * V_GRID[k] * W)
     while delta**2 + abs(x) > B_self:
         x = float(np.nextafter(x, 0.0))
     return delta, x

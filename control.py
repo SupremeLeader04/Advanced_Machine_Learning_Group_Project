@@ -3,12 +3,16 @@
 import csv
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from default_opponent import default_opponent_policy
 from environment import sim_game
 from features import feasible_actions, state_action_features, state_features
+from visualisations import (
+    plot_control_learning_curves,
+    plot_learning_rate_sensitivity,
+    plot_strategy,
+)
 
 FEATURE_SIZES = {"baseline": 150, "quadratic": 300}
 
@@ -16,9 +20,8 @@ CURVE_VALIDATION_SEED = 9000
 SELECTION_VALIDATION_SEED = 10000
 FINAL_TEST_SEED = 20000
 
-# learning rate for control (MC and SARSA weight updates)
 def learning_rate(
-    episode: int, # current training episode
+    episode: int,
     alpha_0: float,
     decay_scale: float = 750.0,
     exponent: float = 0.6
@@ -42,7 +45,6 @@ def exploration_rate(
         epsilon_0 / (1.0 + episode / decay_scale) ** exponent
     )
 
-# this converts (delta, x) into the 2 spending fractions used by the feature representation
 def action_fractions(
     state: list,
     actions: np.ndarray
@@ -51,13 +53,13 @@ def action_fractions(
 
     budget = float(state[1])
 
-    # Each row contains one action: (speed investment, trading position).
-    actions = np.asarray(actions, dtype=float).reshape(-1, 2) # converts into a matrix with 2 rows, and the -1 tells it to automatically find row num
+    # Shape: (number of actions, 2), with columns (delta, x).
+    actions = np.asarray(actions, dtype=float).reshape(-1, 2)
 
-    speed_investments = actions[:, 0] # select every row in respective column index 
+    speed_investments = actions[:, 0]
     trading_positions = actions[:, 1]
 
-    speed_costs = speed_investments ** 2 # total invested into speed so this equals delta squared
+    speed_costs = speed_investments ** 2
     remaining_wealth = np.maximum(0.0, budget - speed_costs)
 
     # Start at zero so actions with no available budget remain well-defined.
@@ -76,23 +78,22 @@ def action_fractions(
 
     return speed_fractions, trading_fractions
 
-# Selects which feature representation to use for a particular state and action
 def encode_action(
     state: list,
     action: list | tuple,
     features: str
 ) -> np.ndarray:
-    """Features for the chosen action."""
+    """Encode an action with 150 baseline or 300 quadratic features."""
 
     if features == "baseline":
-        return state_action_features(state, action).astype(float) # returns the original 150 element vector
+        return state_action_features(state, action).astype(float)
 
     if features != "quadratic":
         raise ValueError("features must be 'baseline' or 'quadratic'.")
 
-    z = state_features(state).astype(float) # sets z as the 150 element vector
+    z = state_features(state).astype(float)  # 50 concatenated state indicators.
 
-    # encodes u and v as arrays which have a certain speed fraction or trading fraction respectively
+    # A single action gives one-element speed and trading fraction arrays.
     u, v = action_fractions(
         state,
         np.asarray([action], dtype=float)
@@ -100,45 +101,45 @@ def encode_action(
 
     u, v = float(u[0]), float(v[0])
 
-    # Retains all original features and adds curvature and an action interaction.
+    # Six blocks of 50 features: retain the baseline terms and add u^2, v^2 and uv.
     return np.concatenate([
-        z, #50 features vector (one hot)
-        u * z, # Scaled by speed fraction
-        v * z, #speed by trading fraction
-        u * u * z,#scaled by speed fraction squared
-        v * v * z,# scaled by trading fraction squared
-        u * v * z # scaled by both
-    ]) # this returns a 300 dimensional flat array
+        z,
+        u * z,
+        v * z,
+        u * u * z,
+        v * v * z,
+        u * v * z
+    ])
 
-# predicts the final wealth associated with every supplied action in the current state
 def action_values(
     state: list,
     actions: list, 
-    theta: np.ndarray, # weights vector
-    features: str # whether to use quadratic or linear features
+    theta: np.ndarray,
+    features: str
 ) -> np.ndarray:
     """
-    Score all feasible actions without building 111 full feature vectors.
+    Score supplied actions without constructing a feature vector for each one.
 
     Q(s,a) = theta.T @ phi(s,a); coefficients depend on the current state.
-    This vectorised calculation is identical to scoring each action separately.
+    This is algebraically equivalent to scoring each action separately;
+    floating-point rounding can differ with the order of operations.
+    Values predict terminal wealth minus the reward shift used in training.
     """
-    # the weights must match the chosen representation
     if features not in FEATURE_SIZES:
         raise ValueError("Unknown feature representation.")
 
     if theta.shape != (FEATURE_SIZES[features],):
         raise ValueError("Incorrect parameter vector length.")
 
-    z = state_features(state).astype(float) # one vector with 50 indicators
+    z = state_features(state).astype(float)
 
-    coefficients = theta.reshape(-1, 50) @ z  # this reshapes theta so that it containrs 3 blocks of 50 weights
-    # this is then multiplied by z to get the 3 dot
+    # Three weight blocks for baseline features, or six for quadratic features.
+    coefficients = theta.reshape(-1, 50) @ z
 
     u, v = action_fractions(
         state,
         np.asarray(actions, dtype=float)
-    ) # sets ui and v as the repsective speed and trading fractions
+    )
 
     q = coefficients[0] + coefficients[1] * u + coefficients[2] * v
 
@@ -171,11 +172,9 @@ def choose_action(
     Random tie-breaking during training prevents an initially all-zero Q
     function from always selecting the first grid action.
     """
-    # conduct checks to ensure epsilon is feasible
     if not 0.0 <= epsilon <= 1.0:
         raise ValueError("epsilon must be in [0, 1].")
 
-    # get the list of all of the feasible actions with tuples (delta, x) inside
     actions = feasible_actions(state)
 
 
@@ -185,7 +184,6 @@ def choose_action(
     else:
         q = action_values(state, actions, theta, features)
         best = np.flatnonzero(q == np.max(q))
-        # handling if there are ties
         index = (
             int(np.random.choice(best))
             if random_ties
@@ -198,12 +196,15 @@ def choose_action(
 
 
 def mc_update(
-    theta: np.ndarray, # current learned weights
-    trajectory: list[np.ndarray], # feature cevtors for all state-action pairs visited during an episode
-    terminal_budget: float, # firm 1s final budget
-    alpha: float # learning rate
+    theta: np.ndarray,
+    trajectory: list[np.ndarray],
+    terminal_budget: float,
+    alpha: float
 ) -> None:
-    """Every-visit on-policy Monte Carlo control."""
+    """Update weights in place using every visited state-action feature vector.
+
+    terminal_budget is the training return, with any reward shift already applied.
+    """
 
     for phi in trajectory:
         error = terminal_budget - float(theta @ phi)
@@ -218,11 +219,15 @@ def sarsa_update(
     alpha: float,
     terminal_budget: float | None = None
 ) -> None:
-    """On-policy one-step TD update with the *actually chosen* next action."""
+    """Update weights in place using the next action actually chosen by SARSA.
 
-    prediction = float(theta @ phi) # calculates prediction
+    Intermediate rewards are zero and gamma is one. At termination,
+    terminal_budget supplies the training return after any reward shift.
+    """
 
-    if terminal_budget is not None: # are we in the terminal budget or not
+    prediction = float(theta @ phi)
+
+    if terminal_budget is not None:
         target = float(terminal_budget)
 
     else:
@@ -231,7 +236,7 @@ def sarsa_update(
                 "A next action feature vector is required before termination."
             )
 
-        target = float(theta @ next_phi) # we need the next state action value
+        target = float(theta @ next_phi)
 
     theta += alpha * (target - prediction) * phi
 
@@ -308,7 +313,7 @@ class SarsaAgent:
         return action
 
     def finish_episode(self, terminal_budget: float) -> None:
-        """Use the observed final budget for the last transition's TD target."""
+        """Apply the final TD update using the supplied, possibly shifted return."""
 
         if self.previous_phi is not None:
             sarsa_update(
@@ -342,7 +347,6 @@ class GreedyAgent:
 
         return action
 
-# how well does a trained control agent perform against a default opponent over multiple simulated games, simply performance measure
 def evaluate_policy(
     theta: np.ndarray | None,
     features: str,
@@ -350,13 +354,14 @@ def evaluate_policy(
     seed: int
 ) -> dict:
     """
-    Evaluate terminal budgets against default; None means default-v-default.
+    Evaluate actual terminal wealth against the default opponent.
+    theta=None evaluates the default policy against itself, without learning.
 
     The random-number state is restored afterwards so evaluation never
     changes the sequence of subsequent training episodes.
     """
 
-    saved_rng = np.random.get_state() #prevents evaluation from consuming random numbers which may be used for later training
+    saved_rng = np.random.get_state()
 
     try:
         np.random.seed(seed)
@@ -369,7 +374,7 @@ def evaluate_policy(
 
         own, opponent = [], []
 
-        for _ in range(n_games): # for each game, runs for 10 periods, uses firm 1s selected policy, firm2 default
+        for _ in range(n_games):
             history = sim_game(
                 n=10,
                 policy_1=firm_1,
@@ -379,29 +384,28 @@ def evaluate_policy(
             own.append(float(history[-1, 1]))
             opponent.append(float(history[-1, 2]))
 
-    finally: #executes even if there is an error during evaluation
+    finally:
         np.random.set_state(saved_rng)
 
-    # covert them into arrays
     own = np.asarray(own)
     opponent = np.asarray(opponent)
 
     return {
-        "mean": float(np.mean(own)), #mean terminal wealth
+        "mean": float(np.mean(own)),
         "median": float(np.median(own)),
         "se": (
             float(np.std(own, ddof=1) / np.sqrt(n_games))
             if n_games > 1
             else 0.0
-        ), #standard error
-        "win_rate": float(np.mean(own > opponent)), #prop games firm 1 finishes wealthier
+        ),
+        "win_rate": float(np.mean(own > opponent)),
         "mean_difference": float(np.mean(own - opponent)), 
         "own": own,
         "opponent": opponent,
     }
 
 
-def train_control( #the main training function for control
+def train_control(
     method: str,
     features: str,
     n_episodes: int,
@@ -410,13 +414,15 @@ def train_control( #the main training function for control
     n_eval_games: int,
     alpha_0: float,
     epsilon_0: float = 0.30,
-    reward_shift: float = 0.0 #changes whether algo learns terminakl wealth or profit relative to 100
+    reward_shift: float = 0.0
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Trains an MC or SARSA agent against the default opponent.
 
     reward_shift=0 uses terminal wealth, while
     reward_shift=100 uses profit relative to the initial budget.
+    Validation always reports actual wealth; the return is final weights,
+    checkpoint episode numbers and mean validation wealth at each checkpoint.
     """
 
     if method not in ("MC", "SARSA"):
@@ -497,7 +503,7 @@ def sample_strategy(
     n_games: int,
     seed: int
 ) -> list[dict]:
-    """Collect greedy actions and states for interpretable policy plots."""
+    """Collect greedy-policy states and actions for plots and allocation diagnostics."""
 
     saved_rng = np.random.get_state()
     samples = []
@@ -540,107 +546,6 @@ def sample_strategy(
     return samples
 
 
-def mean_by_group( #divide obs into groups and calculate the average value of a chosen variable within each group
-    samples: list[dict],
-    key: str,
-    indices: np.ndarray,
-    n_groups: int
-) -> np.ndarray:
-    """Group mean, using NaN for bins without observations."""
-
-    values = np.asarray([row[key] for row in samples]) #extract the variable we are interested in
-    result = np.full(n_groups, np.nan)
-
-    for group in range(n_groups):
-        group_values = values[indices == group]
-
-        if len(group_values):
-            result[group] = np.mean(group_values)
-
-    return result
-
-
-def plot_strategy(
-    mc_samples: list[dict],
-    td_samples: list[dict],
-    output_dir: Path
-) -> None:
-    """Plot chosen speed/trade fractions against time and signal strength."""
-
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-
-    signal_edges = np.array([
-        0, 0.5, 1.0, 1.5, 2.0, 3.0, np.inf
-    ])
-
-    signal_labels = [
-        "0–0.5", "0.5–1", "1–1.5",
-        "1.5–2", "2–3", "3+"
-    ]
-
-    for name, samples in [("MC", mc_samples), ("SARSA", td_samples)]:
-        t = np.array([row["t"] for row in samples])
-        signal = np.array([abs(row["g"]) for row in samples])
-
-        signal_bin = np.searchsorted(
-            signal_edges[1:],
-            signal,
-            side="right"
-        )
-
-        for col, metric in enumerate(["speed_fraction", "trade_fraction"]):
-            axes[0, col].plot(
-                range(10),
-                mean_by_group(samples, metric, t, 10),
-                marker="o",
-                label=name
-            )
-
-            axes[1, col].plot(
-                range(len(signal_labels)),
-                mean_by_group(
-                    samples,
-                    metric,
-                    signal_bin,
-                    len(signal_labels)
-                ),
-                marker="o",
-                label=name
-            )
-
-    for col, label in enumerate([
-        "Speed spending / budget",
-        "|Trade| / post-speed wealth"
-    ]):
-        axes[0, col].set(
-            xlabel="Period",
-            ylabel=label,
-            title=f"{label} by period",
-            ylim=(-0.05, 1.05)
-        )
-
-        axes[1, col].set(
-            xlabel="|Signal| bin",
-            ylabel=label,
-            title=f"{label} by signal magnitude",
-            ylim=(-0.05, 1.05)
-        )
-
-        axes[1, col].set_xticks(
-            range(len(signal_labels)),
-            signal_labels,
-            rotation=30
-        )
-
-        for row in range(2):
-            axes[row, col].grid(alpha=0.25)
-            axes[row, col].legend()
-
-    fig.tight_layout()
-    fig.savefig(output_dir / "learned_strategy.png", dpi=200)
-    plt.close(fig)
-
-
 def _evaluate_candidates(
     candidates: dict,
     n_games: int,
@@ -648,7 +553,11 @@ def _evaluate_candidates(
     output_dir: Path,
     split: str
 ) -> None:
-    """Report per-policy SE and across-training-seed SD as separate quantities."""
+    """Save per-policy evaluation SE and across-training-seed SD in one CSV.
+
+    Across-seed SD uses ddof=0 to describe the observed training runs;
+    it is distinct from uncertainty across evaluation games.
+    """
 
     rows = []
 
@@ -665,8 +574,6 @@ def _evaluate_candidates(
                 theta,
                 candidate["weights_file"]
             ))
-
-    print(f"\n{split.capitalize()} evaluation: {n_games} games, seed={seed}")
 
     for method, training_seed, features, alpha, theta, weights_file in policies:
         result = evaluate_policy(theta, features, n_games, seed)
@@ -687,47 +594,25 @@ def _evaluate_candidates(
             "weights_file": weights_file
         })
 
-        print(
-            f"  {method} seed={training_seed}: mean B10={result['mean']:.2f} "
-            f"+/- {result['se']:.2f} (SE over evaluation games)",
-            flush=True
-        )
-
-    summaries = []
-
+    # Keep individual results and across-seed statistics in one table.
     for method in ["Default", *candidates]:
         selected = [row for row in rows if row["method"] == method]
         means = np.array([row["mean_budget"] for row in selected])
-        sd = float(means.std()) if method != "Default" else ""
-
-        summaries.append({
-            "method": method,
-            "features": selected[0]["features"],
-            "alpha_0": selected[0]["alpha_0"],
-            "split": split,
-            "evaluation_games": n_games,
-            "evaluation_seed": seed,
-            "training_runs": len(selected) if method != "Default" else 0,
-            "mean_budget": float(means.mean()),
-            "sd_across_training_seeds": sd
-        })
-
-        if method != "Default":
-            print(
-                f"  {method}: mean B10={means.mean():.2f} +/- {sd:.2f} "
-                "(SD across training seeds, not an evaluation SE)"
-            )
+        for row in selected:
+            row.update({
+                "training_runs": len(selected) if method != "Default" else 0,
+                "mean_across_training_seeds": float(means.mean()),
+                "sd_across_training_seeds": float(means.std()) if method != "Default" else ""
+            })
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for filename, data in [
-        (f"{split}_evaluation.csv", rows),
-        (f"{split}_summary.csv", summaries)
-    ]:
-        with (output_dir / filename).open("w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=list(data[0]))
-            writer.writeheader()
-            writer.writerows(data)
+    with (output_dir / f"{split}_evaluation.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def evaluate_final_test(
@@ -830,29 +715,16 @@ def run_experiment(
 
     alpha_settings = {"MC": alpha_mc, "SARSA": alpha_sarsa}
 
-    print(f"Features: {features} ({FEATURE_SIZES[features]} parameters)")
-    print(f"Training episodes per method/seed: {n_episodes}; seeds: {n_seeds}")
-    print(f"Learning-rate alpha0: {alpha_settings}")
-    print(f"Checkpoint validation: {n_eval_games} games, seed={CURVE_VALIDATION_SEED}")
-    print(f"Candidate validation: {n_validation_games} games, seed={SELECTION_VALIDATION_SEED}")
-    print("Exploration: max(0.05, 0.30 / (1 + episode/750)^0.8)")
-
     all_weights = {"MC": [], "SARSA": []}
     all_curves = {"MC": [], "SARSA": []}
     training_seeds = np.arange(123, 123 + n_seeds)
 
-    # Match the benchmark to the games used for the checkpoint curves.
+    # Use the same game count and RNG seed as checkpoint validation.
     default_curve = evaluate_policy(
         None,
         features,
         n_eval_games,
         CURVE_VALIDATION_SEED
-    )
-
-    print(
-        f"Checkpoint default: mean B10={default_curve['mean']:.2f} "
-        f"+/- {default_curve['se']:.2f} (SE)",
-        flush=True
     )
 
     for method in ("MC", "SARSA"):
@@ -874,60 +746,9 @@ def run_experiment(
             all_curves[method].append(curve)
 
     if make_learning_curve_plot:
-        # Plot greedy-policy validation performance during learning.
-        fig, ax = plt.subplots(figsize=(9, 5))
-
-        for method in ("MC", "SARSA"):
-            curves = np.asarray(all_curves[method])
-
-            mean = curves.mean(axis=0)
-            sd = curves.std(axis=0)
-
-            line, = ax.plot(
-                checkpoints,
-                mean,
-                label=method
-            )
-
-            if n_seeds > 1:
-                ax.fill_between(
-                    checkpoints,
-                    mean - sd,
-                    mean + sd,
-                    color=line.get_color(),
-                    alpha=0.18
-                )
-
-        ax.axhline(
-            default_curve["mean"],
-            linestyle="--",
-            color="grey",
-            label="Default vs default (same checkpoint validation settings)"
+        plot_control_learning_curves(
+            checkpoints, all_curves, default_curve["mean"], features, output_dir
         )
-
-        # Doing nothing always preserves the initial 100; this is a key sanity benchmark.
-        ax.axhline(
-            100.0,
-            linestyle=":",
-            color="black",
-            label="Hold cash: B10 = 100"
-        )
-
-        ax.set(
-            xlabel="Training episodes",
-            ylabel="Mean greedy-policy validation terminal budget",
-            title=f"Control validation learning curves ({features})"
-        )
-
-        ax.legend()
-        ax.grid(alpha=0.25)
-
-        fig.tight_layout()
-        fig.savefig(
-            output_dir / "control_learning_curves.png",
-            dpi=200
-        )
-        plt.close(fig)
 
     if make_strategy_plots:
         # Inspect the greedy policies from the final training seed.
@@ -964,30 +785,6 @@ def run_experiment(
                         "method": method,
                         **sample
                     })
-
-    with (output_dir / "schedules.csv").open("w", newline="") as file:
-        writer = csv.writer(file)
-
-        writer.writerow([
-            "episode",
-            "epsilon",
-            "alpha_mc",
-            "alpha_sarsa"
-        ])
-
-        for episode in range(1, n_episodes + 1):
-            writer.writerow([
-                int(episode),
-                exploration_rate(int(episode)),
-                learning_rate(
-                    int(episode),
-                    alpha_settings["MC"]
-                ),
-                learning_rate(
-                    int(episode),
-                    alpha_settings["SARSA"]
-                )
-            ])
 
     np.savez(
         output_dir / "trained_weights.npz",
@@ -1039,15 +836,13 @@ def run_learning_rate_sensitivity(
     n_validation_games: int = 1000,
     output_dir: str | Path = Path("control_results") / "learning_rate_sensitivity"
 ) -> None:
-    """Compare initial rates on baseline features without using final-test games.
+    """Compare initial rates using baseline features and unshifted rewards.
 
     The consolidated CSV has one row per method/rate/training seed, with
     the candidate's mean and SD repeated alongside individual seed results.
     Its statistics use final candidate validation; plots use checkpoint validation.
+    No independent test games are evaluated.
     """
-
-    # Figures are saved to disk; no interactive plotting window is needed.
-    plt.switch_backend("Agg")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1116,40 +911,10 @@ def run_learning_rate_sensitivity(
         writer.writerows(consolidated_rows)
 
     for method in ("MC", "SARSA"):
-
-        fig, ax = plt.subplots(figsize=(9, 5))
-
-        for alpha_0, curves in zip(learning_rates, learning_curves[method]):
-            mean = curves.mean(axis=0)
-            sd = curves.std(axis=0)
-
-            line, = ax.plot(checkpoints, mean, label=f"alpha0 = {alpha_0:g}")
-            ax.fill_between(
-                checkpoints, mean - sd, mean + sd,
-                color=line.get_color(), alpha=0.2
-            )
-
-        ax.axhline(default_curve_mean, linestyle="--", color="grey",
-                   label="Default vs default (checkpoint validation)")
-        ax.axhline(100.0, linestyle=":", color="black", label="Hold cash = 100")
-
-        ax.set(
-            xlabel="Training episodes",
-            ylabel="Mean validation terminal wealth",
-            title=f"{method}: learning-rate sensitivity\n"
-                  f"{n_eval_games} validation games per checkpoint (seed {CURVE_VALIDATION_SEED})"
+        plot_learning_rate_sensitivity(
+            method, learning_rates, checkpoints, learning_curves[method],
+            output_dir, n_eval_games, CURVE_VALIDATION_SEED, default_curve_mean
         )
-        ax.legend()
-        ax.grid(alpha=0.25)
-
-        fig.text(
-            0.5, 0.02,
-            f"Shading: +/- 1 SD across {n_seeds} training seeds, not a confidence interval.",
-            ha="center", fontsize=9
-        )
-        fig.tight_layout(rect=(0, 0.05, 1, 1))
-        fig.savefig(output_dir / f"{method.lower()}_learning_rate_sensitivity.png", dpi=200)
-        plt.close(fig)
 
     print(f"\nSaved consolidated validation results and sensitivity plots in: {output_dir.resolve()}")
 

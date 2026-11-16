@@ -3,12 +3,12 @@
 import csv
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from default_opponent import default_opponent_policy
 from environment import sim_game
 from features import feasible_actions, state_action_features
+from visualisations import plot_prediction_comparison, plot_prediction_learning_rates
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "prediction"
 
@@ -220,6 +220,7 @@ def run_experiment(
     td_weights = []
 
     for i in range(n_seeds):
+        print(f"Training prediction seed {123 + i} ({i + 1}/{n_seeds})", flush=True)
 
         theta_mc, theta_td, checkpoints, mc_errors, td_errors = (
             train_predictors(
@@ -240,97 +241,15 @@ def run_experiment(
     mc_runs = np.array(mc_runs)
     td_runs = np.array(td_runs)
 
-    print("Fixed policy: 20% speed spending, 50% trading exposure")
-    print(f"Training: {n_episodes} games per seed; {n_seeds} independent seeds")
-    print(f"Validation: {n_validation} independent games")
-
-    baseline_rmse = np.sqrt(np.mean((100 - y_val)**2))
-
-    print(f"Constant-100 RMSE: {baseline_rmse:.3f}")
-    print(
-        f"MC final RMSE: {mc_runs[:, -1].mean():.3f} "
-        f"± {mc_runs[:, -1].std():.3f}"
-    )
-    print(
-        f"TD final RMSE: {td_runs[:, -1].mean():.3f} "
-        f"± {td_runs[:, -1].std():.3f}"
-    )
-
-    print("\nStep-size schedule: alpha(n) = alpha_0 / (1 + n/500)^0.6")
-
-    for name, alpha_0 in [
-        ("Monte Carlo", 0.001),
-        ("TD(0)", 0.005)
-    ]:
-        print(f"\n{name} (alpha_0 = {alpha_0}):")
-
-        for n in [1, 100, 500, 1000, n_episodes]:
-            print(
-                f"Episode {n:5d}: "
-                f"alpha = {learning_rate(n, alpha_0=alpha_0):.6f}"
-            )
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for name, values in [
-        ("Monte Carlo", mc_runs),
-        ("TD(0)", td_runs)
-    ]:
-
-        mean = values.mean(axis=0)
-        std = values.std(axis=0)
-
-        line, = ax.plot(checkpoints, mean, label=name)
-
-        ax.fill_between(
-            checkpoints,
-            mean - std,
-            mean + std,
-            color=line.get_color(),
-            alpha=0.2
-        )
-
-    ax.set(
-        xlabel="Training episodes",
-        ylabel="Held-out RMSE (terminal budget units)",
-        title="On-policy prediction: Monte Carlo vs TD(0)"
-    )
-
-    ax.legend()
-    ax.grid(alpha=0.25)
-
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "prediction_comparison.png", dpi=200)
-    plt.close(fig)
+    plot_prediction_comparison(checkpoints, mc_runs, td_runs, OUTPUT_DIR)
 
     steps = np.arange(1, n_episodes + 1)
+    schedules = {
+        name: [learning_rate(int(n), alpha_0=alpha_0) for n in steps]
+        for name, alpha_0 in [("Monte Carlo", 0.001), ("TD(0)", 0.005)]
+    }
+    plot_prediction_learning_rates(steps, schedules, OUTPUT_DIR)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-
-    # Plot the separate learning-rate schedules used for MC and TD.
-    for name, alpha_0 in [
-        ("Monte Carlo", 0.001),
-        ("TD(0)", 0.005)
-    ]:
-        ax.plot(
-            steps,
-            [learning_rate(int(n), alpha_0=alpha_0) for n in steps],
-            label=name
-        )
-
-    ax.set(
-        xlabel="Training episode",
-        ylabel="Step size alpha",
-        title="Decreasing learning-rate schedules"
-    )
-
-    ax.legend()
-    ax.grid(alpha=0.25)
-
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "prediction_learning_rate.png", dpi=200)
-    plt.close(fig)
-    
     # Save trained weights from every seed for later evaluation.
     np.savez(
         OUTPUT_DIR / "prediction_weights.npz",
@@ -338,10 +257,7 @@ def run_experiment(
         theta_td=np.array(td_weights)
     )
 
-    print(
-        f"\nSaved in {OUTPUT_DIR}: prediction_comparison.png, "
-        "prediction_learning_rate.png, prediction_weights.npz"
-    )
+    print(f"Saved prediction figures and weights in: {OUTPUT_DIR}")
 
 
 def compare_learning_rates(
@@ -421,8 +337,6 @@ def compare_learning_rates(
                 "sd_across_training_seeds": sd
             })
 
-            print(f"{method} alpha0={alpha:g}: {mean:.3f} +/- {sd:.3f}")
-
     # Group each table by method, retaining the candidate order above.
     summary_rows.sort(key=lambda row: row["method"])
     seed_rows.sort(key=lambda row: row["method"])
@@ -469,10 +383,7 @@ def evaluate_test_set(
     # The data generator uses the same fixed policy with a fresh seed.
     X_test, y_test = validation_data(n_games=n_games, seed=seed)
 
-    print(f"Independent test set: {n_games} games; seed={seed}")
-
     baseline_rmse = float(np.sqrt(np.mean((100.0 - y_test) ** 2)))
-    print(f"Constant-100 test RMSE: {baseline_rmse:.3f}")
 
     summary_rows = []
 
@@ -481,15 +392,6 @@ def evaluate_test_set(
             prediction_rmse(theta, X_test, y_test)
             for theta in weights
         ])
-
-        print(f"\n{name}:")
-        for index, error in enumerate(errors):
-            print(f"  Saved training run {index + 1}: {error:.3f}")
-
-        print(
-            f"  Mean test RMSE: {errors.mean():.3f} "
-            f"± {errors.std():.3f} (SD across training seeds)"
-        )
 
         summary_rows.append({
             "method": name,

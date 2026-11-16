@@ -1,0 +1,413 @@
+"""Plot precomputed experiment results; never train, evaluate or sample policies.
+
+Shared home for Prediction and Control experiment visualisations.
+
+Regenerate an experiment's learning curves without retraining::
+
+    regenerate_control_figures("path/to/trained_weights.npz")
+
+Pass make_strategy_plots=True to also read strategy_samples.csv from the
+archive's folder. If samples were not saved, they cannot be reconstructed
+from weights alone without policy sampling; this module never samples.
+
+Regenerate one method's learning-rate comparison::
+
+    regenerate_learning_rate_sensitivity(
+        ["rate1/trained_weights.npz", "rate2/trained_weights.npz"],
+        method="SARSA", output_dir="comparison"
+    )
+
+An optional output_dir for regeneration keeps the original figures untouched.
+"""
+
+import csv
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def mean_by_group( #divide obs into groups and calculate the average value of a chosen variable within each group
+    samples: list[dict],
+    key: str,
+    indices: np.ndarray,
+    n_groups: int
+) -> np.ndarray:
+    """Group mean, using NaN for bins without observations."""
+
+    values = np.asarray([row[key] for row in samples]) #extract the variable we are interested in
+    result = np.full(n_groups, np.nan)
+
+    for group in range(n_groups):
+        group_values = values[indices == group]
+
+        if len(group_values):
+            result[group] = np.mean(group_values)
+
+    return result
+
+
+def plot_strategy(
+    mc_samples: list[dict],
+    td_samples: list[dict],
+    output_dir: Path
+) -> None:
+    """Plot chosen speed/trade fractions against time and signal strength."""
+
+    plt.switch_backend("Agg")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+
+    signal_edges = np.array([
+        0, 0.5, 1.0, 1.5, 2.0, 3.0, np.inf
+    ])
+
+    signal_labels = [
+        "0–0.5", "0.5–1", "1–1.5",
+        "1.5–2", "2–3", "3+"
+    ]
+
+    for name, samples in [("MC", mc_samples), ("SARSA", td_samples)]:
+        t = np.array([row["t"] for row in samples])
+        signal = np.array([abs(row["g"]) for row in samples])
+
+        signal_bin = np.searchsorted(
+            signal_edges[1:],
+            signal,
+            side="right"
+        )
+
+        for col, metric in enumerate(["speed_fraction", "trade_fraction"]):
+            axes[0, col].plot(
+                range(10),
+                mean_by_group(samples, metric, t, 10),
+                marker="o",
+                label=name
+            )
+
+            axes[1, col].plot(
+                range(len(signal_labels)),
+                mean_by_group(
+                    samples,
+                    metric,
+                    signal_bin,
+                    len(signal_labels)
+                ),
+                marker="o",
+                label=name
+            )
+
+    for col, label in enumerate([
+        "Speed spending / budget",
+        "|Trade| / post-speed wealth"
+    ]):
+        axes[0, col].set(
+            xlabel="Period",
+            ylabel=label,
+            title=f"{label} by period",
+            ylim=(-0.05, 1.05)
+        )
+
+        axes[1, col].set(
+            xlabel="|Signal| bin",
+            ylabel=label,
+            title=f"{label} by signal magnitude",
+            ylim=(-0.05, 1.05)
+        )
+
+        axes[1, col].set_xticks(
+            range(len(signal_labels)),
+            signal_labels,
+            rotation=30
+        )
+
+        for row in range(2):
+            axes[row, col].grid(alpha=0.25)
+            axes[row, col].legend()
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "learned_strategy.png", dpi=200)
+    plt.close(fig)
+
+
+def regenerate_control_figures(
+    weights_path: str | Path,
+    output_dir: str | Path | None = None,
+    make_learning_curve_plot: bool = True,
+    make_strategy_plots: bool = False
+) -> None:
+    """Redraw saved curves and, optionally, strategy_samples.csv; never simulate."""
+
+    weights_path = Path(weights_path)
+    output_dir = Path(output_dir) if output_dir is not None else weights_path.parent
+
+    if make_learning_curve_plot:
+        with np.load(weights_path) as saved:
+            curves = {
+                method: saved[f"{method.lower()}_validation"]
+                for method in ("MC", "SARSA")
+                if f"{method.lower()}_validation" in saved
+            }
+            if not curves:
+                raise ValueError("The archive contains no saved validation curves.")
+
+            benchmark = (
+                float(saved["default_curve_mean"])
+                if "default_curve_mean" in saved else None
+            )
+            plot_control_learning_curves(
+                saved["checkpoints"], curves, benchmark,
+                str(saved["features"]), output_dir
+            )
+
+    if make_strategy_plots:
+        # Saved weights alone do not contain the states/actions needed here.
+        with (weights_path.parent / "strategy_samples.csv").open(newline="") as file:
+            samples = {"MC": [], "SARSA": []}
+            for row in csv.DictReader(file):
+                method = row.pop("method")
+                sample = {key: float(value) for key, value in row.items()}
+                samples[method].append(sample)
+
+        plot_strategy(samples["MC"], samples["SARSA"], output_dir)
+
+
+def regenerate_learning_rate_sensitivity(
+    weights_paths: list[str | Path],
+    method: str,
+    output_dir: str | Path
+) -> None:
+    """Redraw one sensitivity figure from compatible saved experiment archives."""
+
+    if method not in ("MC", "SARSA"):
+        raise ValueError("method must be MC or SARSA.")
+    if not weights_paths:
+        raise ValueError("Provide at least one saved experiment archive.")
+
+    learning_rates, curves = [], []
+    reference = None
+    benchmark = None
+
+    for path in weights_paths:
+        with np.load(path) as saved:
+            settings = (
+                str(saved["features"]), float(saved["reward_shift"]),
+                int(saved["curve_validation_games"]),
+                int(saved["curve_validation_seed"]),
+                tuple(saved["training_seeds"]), tuple(saved["checkpoints"])
+            )
+            if reference is not None and settings != reference:
+                raise ValueError("Archives must share features, reward shift and validation design.")
+            reference = settings
+            learning_rates.append(float(saved[f"alpha_{method.lower()}"]))
+            curves.append(saved[f"{method.lower()}_validation"])
+            if "default_curve_mean" in saved:
+                benchmark = float(saved["default_curve_mean"])
+
+    order = np.argsort(learning_rates)
+    plot_learning_rate_sensitivity(
+        method, [learning_rates[i] for i in order], np.asarray(reference[5]),
+        [curves[i] for i in order], Path(output_dir),
+        reference[2], reference[3], benchmark
+    )
+
+
+def plot_control_learning_curves(
+    checkpoints: np.ndarray,
+    learning_curves: dict,
+    default_curve_mean: float | None,
+    features: str,
+    output_dir: Path
+) -> None:
+    """Plot per-seed checkpoint wealth arrays, with shape (seeds, checkpoints)."""
+
+    plt.switch_backend("Agg")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Plot greedy-policy validation performance during learning.
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    for method in learning_curves:
+        curves = np.asarray(learning_curves[method])
+
+        mean = curves.mean(axis=0)
+        sd = curves.std(axis=0)
+
+        line, = ax.plot(
+            checkpoints,
+            mean,
+            label=method
+        )
+
+        if len(curves) > 1:
+            ax.fill_between(
+                checkpoints,
+                mean - sd,
+                mean + sd,
+                color=line.get_color(),
+                alpha=0.18
+            )
+
+    if default_curve_mean is not None:
+        ax.axhline(
+            default_curve_mean,
+            linestyle="--",
+            color="grey",
+            label="Default vs default (same checkpoint validation settings)"
+        )
+
+    # Doing nothing always preserves the initial 100; this is a key sanity benchmark.
+    ax.axhline(
+        100.0,
+        linestyle=":",
+        color="black",
+        label="Hold cash: B10 = 100"
+    )
+
+    ax.set(
+        xlabel="Training episodes",
+        ylabel="Mean greedy-policy validation terminal budget",
+        title=f"Control validation learning curves ({features})"
+    )
+
+    ax.legend()
+    ax.grid(alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(
+        output_dir / "control_learning_curves.png",
+        dpi=200
+    )
+    plt.close(fig)
+
+
+
+def plot_learning_rate_sensitivity(
+    method: str,
+    learning_rates: list[float],
+    checkpoints: np.ndarray,
+    learning_curves: list[np.ndarray],
+    output_dir: Path,
+    n_eval_games: int,
+    validation_seed: int,
+    default_curve_mean: float | None = None
+) -> None:
+    """Plot one method across rates using precomputed per-seed wealth curves."""
+
+    plt.switch_backend("Agg")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_seeds = len(learning_curves[0])
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    for alpha_0, curves in zip(learning_rates, learning_curves):
+        mean = curves.mean(axis=0)
+        sd = curves.std(axis=0)
+
+        line, = ax.plot(checkpoints, mean, label=f"alpha0 = {alpha_0:g}")
+        ax.fill_between(
+            checkpoints, mean - sd, mean + sd,
+            color=line.get_color(), alpha=0.2
+        )
+
+    if default_curve_mean is not None:
+        ax.axhline(default_curve_mean, linestyle="--", color="grey",
+                   label="Default vs default (checkpoint validation)")
+    ax.axhline(100.0, linestyle=":", color="black", label="Hold cash = 100")
+
+    ax.set(
+        xlabel="Training episodes",
+        ylabel="Mean validation terminal wealth",
+        title=f"{method}: learning-rate sensitivity\n"
+              f"{n_eval_games} validation games per checkpoint (seed {validation_seed})"
+    )
+    ax.legend()
+    ax.grid(alpha=0.25)
+
+    fig.text(
+        0.5, 0.02,
+        f"Shading: +/- 1 SD across {n_seeds} training seeds, not a confidence interval.",
+        ha="center", fontsize=9
+    )
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.savefig(output_dir / f"{method.lower()}_learning_rate_sensitivity.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_prediction_comparison(
+    checkpoints: np.ndarray,
+    mc_runs: np.ndarray,
+    td_runs: np.ndarray,
+    output_dir: str | Path
+) -> None:
+    """Plot MC/TD validation RMSE curves, supplied as (seeds, checkpoints)."""
+
+    plt.switch_backend("Agg")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for name, values in [
+        ("Monte Carlo", mc_runs),
+        ("TD(0)", td_runs)
+    ]:
+
+        mean = values.mean(axis=0)
+        std = values.std(axis=0)
+
+        line, = ax.plot(checkpoints, mean, label=name)
+
+        ax.fill_between(
+            checkpoints,
+            mean - std,
+            mean + std,
+            color=line.get_color(),
+            alpha=0.2
+        )
+
+    ax.set(
+        xlabel="Training episodes",
+        ylabel="Held-out RMSE (terminal budget units)",
+        title="On-policy prediction: Monte Carlo vs TD(0)"
+    )
+
+    ax.legend()
+    ax.grid(alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "prediction_comparison.png", dpi=200)
+    plt.close(fig)
+
+
+
+def plot_prediction_learning_rates(
+    steps: np.ndarray,
+    schedules: dict[str, list[float]],
+    output_dir: str | Path
+) -> None:
+    """Plot precomputed learning-rate schedules; no schedule logic lives here."""
+
+    plt.switch_backend("Agg")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    # Plot the separate learning-rate schedules used for MC and TD.
+    for name, values in schedules.items():
+        ax.plot(steps, values, label=name)
+
+    ax.set(
+        xlabel="Training episode",
+        ylabel="Step size alpha",
+        title="Decreasing learning-rate schedules"
+    )
+
+    ax.legend()
+    ax.grid(alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "prediction_learning_rate.png", dpi=200)
+    plt.close(fig)
+

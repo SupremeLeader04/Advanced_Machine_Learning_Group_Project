@@ -1,26 +1,28 @@
 """2.4 Refine your RL agents -- final agent, experiments, figures and tables.
 
     python refine_experiments.py
+    python refine_experiments.py --evaluate
 
-RUN_EXPERIMENTS = False (default): trains only the final agent (finite-horizon
-LSPI against the default opponent, about 5 minutes on one CPU core) and writes
-rlagent/agentE_theta.npy. This is far below the 40 Colab compute-unit budget.
+--evaluate runs the saved tournament policy against the default opponent in
+the original Section 2.1 environment. It only requires NumPy.
 
-RUN_EXPERIMENTS = True: also reproduces every number, figure and table of the
-2.4 write-up in refine_results/ (about 80 minutes on a 2-core CPU): extra
-training seeds, incremental Q-learning, an actor-critic neural network
-(needs PyTorch), a feature ablation, pool-trained and fictitious-play LSPI,
-the 2.3 baselines, the robustness matrix, and the policy description.
+RUN_EXPERIMENTS = False (default): trains the final agent against the default
+opponent in the Section 2.1 environment and writes rlagent/agentE_theta.npy.
 
-All seeds are fixed, so re-running reproduces the reported numbers exactly.
+RUN_EXPERIMENTS = True: also runs the method comparisons in the Section 2.1
+environment and writes updated tables and figures to refine_results/.
 """
 
+import argparse
 import csv
 import os
 import time
 from pathlib import Path
 
 import numpy as np
+
+from default_opponent import default_opponent_policy
+from environment import sim_game
 
 RUN_EXPERIMENTS = False
 
@@ -31,7 +33,7 @@ AGENT_FILE = Path("rlagent") / "agentE_theta.npy"
 # Tuning parameters (Table table_2_4_tuning.csv)
 # ---------------------------------------------------------------------------
 FINAL_CFG = dict(n_rounds=6, games_per_round=6000, epsilon=0.1, ridge=1.0,
-                 buffer_rounds=6, seed=0, eval_games=20000)
+                 buffer_rounds=6, seed=0, eval_games=2000)
 EXTRA_SEEDS = [1, 2, 3, 4]
 AC_CFG = dict(n_updates=12000, games=512, lr=1e-3, entropy=0.003, clip_return=1000.0,
               seed=0, eval_every=1200, eval_games=10000)
@@ -52,6 +54,31 @@ if os.environ.get("REFINE_QUICK"):
     EXTRA_SEEDS, TEST_GAMES, ROBUST_GAMES = [1], 1000, 300
 
 
+def evaluate_saved_agent(n_games=TEST_GAMES, seed=TEST_SEED):
+    """Evaluate the shipped tournament policy directly in the Section 2.1 game."""
+    from rlagent.agentE import policy
+
+    def agent(state):
+        return list(policy(*state))
+
+    rng_state = np.random.get_state()
+    try:
+        np.random.seed(seed)
+        budgets = np.empty((n_games, 2))
+        for i in range(n_games):
+            budgets[i] = sim_game(policy_1=agent, policy_2=default_opponent_policy)[-1, 1:3]
+    finally:
+        np.random.set_state(rng_state)
+
+    own, opp = budgets.T
+    print(f"{n_games:,} games against default in the Section 2.1 environment (seed {seed})")
+    print(f"Mean terminal wealth: {own.mean():,.2f} (SE {own.std(ddof=1) / np.sqrt(n_games):,.2f})")
+    print(f"Opponent mean: {opp.mean():,.2f}")
+    print(f"Median terminal wealth: {np.median(own):,.2f}")
+    print(f"Bankruptcy rate: {np.mean(own == 0):.2%}")
+    print(f"Finished ahead of opponent: {np.mean(own > opp):.2%}")
+
+
 def main():
     """Train the final agent and save its weights; optionally run all experiments."""
     from refine import train_backward
@@ -68,11 +95,12 @@ def main():
 # Experiments
 # ---------------------------------------------------------------------------
 def run_experiments(theta_final, curve_final):
-    """Reproduce every table and figure of the 2.4 write-up (RUN_EXPERIMENTS = True)."""
+    """Run the method comparisons and write new tables and figures."""
     import refine
-    from refine import ac_policy, greedy_batch, train_ac, train_backward, train_qlearning
-    from refine_env import (Mixture, default_batch, hold_batch, myopic_batch,
-                            play_chunked, standard_pool, summarise)
+    from refine import (
+        Mixture, ac_policy, greedy_batch, hold_batch, myopic_batch, rollouts,
+        standard_pool, summarise, train_ac, train_backward, train_qlearning,
+    )
     OUT.mkdir(exist_ok=True)
 
     # 1) stability across training seeds
@@ -80,7 +108,7 @@ def run_experiments(theta_final, curve_final):
     for s in [FINAL_CFG["seed"]] + EXTRA_SEEDS:
         th = theta_final if s == FINAL_CFG["seed"] else \
             train_backward(**dict(FINAL_CFG, seed=s), verbose=False)[0]
-        b1, b2 = play_chunked(greedy_batch(th), default_batch, TEST_GAMES, seed=TEST_SEED)
+        b1, b2 = rollouts(greedy_batch(th), default_opponent_policy, TEST_GAMES, seed=TEST_SEED)
         seed_rows.append(dict(training_seed=s, **summarise(b1, b2)))
         print(f"seed {s}: {seed_rows[-1]['mean']:.0f}", flush=True)
     _write_csv("table_2_4_seeds.csv", seed_rows)
@@ -90,7 +118,7 @@ def run_experiments(theta_final, curve_final):
     ac_model, curve_ac = train_ac(**AC_CFG)
     refine.FEATURE_SET = "plain"                       # ablation: group's 2.3 action terms
     th_plain, _ = train_backward(**FINAL_CFG, verbose=False)
-    b1, b2 = play_chunked(greedy_batch(th_plain), default_batch, TEST_GAMES, seed=TEST_SEED)
+    b1, b2 = rollouts(greedy_batch(th_plain), default_opponent_policy, TEST_GAMES, seed=TEST_SEED)
     refine.FEATURE_SET = "economic"
     ablation_row = dict(name="LSPI finite-horizon, 2.3 action features (ablation)",
                         **summarise(b1, b2), p_zero=float(np.mean(b1 == 0)),
@@ -119,11 +147,11 @@ def run_experiments(theta_final, curve_final):
 
     # 3) held-out performance against the default (same 50,000 test games for all)
     rows, budgets = [], {}
-    bench = {"Default (firm 1 also default)": default_batch, "Hold cash": hold_batch,
+    bench = {"Default (firm 1 also default)": default_opponent_policy, "Hold cash": hold_batch,
              "One-step look-ahead (model-based)": myopic_batch("default")}
     others = {"Actor-critic NN (raw state)": ac_policy(ac_model, greedy=True)}
     for name, pol in {**bench, **agents, **others}.items():
-        b1, b2 = play_chunked(pol, default_batch, TEST_GAMES, seed=TEST_SEED)
+        b1, b2 = rollouts(pol, default_opponent_policy, TEST_GAMES, seed=TEST_SEED)
         budgets[name] = b1
         rows.append(dict(name=name, **summarise(b1, b2), p_zero=float(np.mean(b1 == 0)),
                          p_above_100=float(np.mean(b1 > 100))))
@@ -136,7 +164,7 @@ def run_experiments(theta_final, curve_final):
     robust = []
     for an, ap in agents.items():
         for on, op in opponents.items():
-            b1, b2 = play_chunked(ap, op, ROBUST_GAMES, seed=ROBUST_SEED)
+            b1, b2 = rollouts(ap, op, ROBUST_GAMES, seed=ROBUST_SEED)
             robust.append(dict(agent=an, opponent=on, **summarise(b1, b2)))
         print(f"robustness done: {an}", flush=True)
     _write_csv("table_2_4_robustness.csv", robust)
@@ -176,14 +204,16 @@ def _write_csv(name, rows):
 
 def write_tuning_table():
     """Write the table of tuning choices (table_2_4_tuning.csv)."""
-    from refine import H_NAMES, SPEED_FRACS, TRADE_FRACS
+    from refine import H_NAMES, MAX_EFFECTIVE_SPEED, SPEED_FRACS, TRADE_FRACS
     rows = [
         ("speed grid u = δ²/B", ", ".join(f"{x:g}" for x in SPEED_FRACS),
          "finer at small spends: δ=1 costs only 1% of B=100 but changes P(win) a lot"),
+        ("maximum effective speed for our agent", f"{MAX_EFFECTIVE_SPEED:g}",
+         "prevents overflow when the supplied simulator computes exp(2 × effective speed)"),
         ("trade grid v = |x|/W", ", ".join(f"{x:g}" for x in TRADE_FRACS), "as in 2.3; direction = sign(g)"),
         ("action terms h(s,a)", " | ".join(H_NAMES), "interacted with the 50 state indicators of 2.3.1"),
         ("Q scaling", "Q = B_t · θ_t'φ", "value roughly proportional to wealth; target ratio ρ = B_{t+1}/B_t"),
-        ("LSPI rounds", FINAL_CFG["n_rounds"], "value curve flat after round 4"),
+        ("LSPI rounds", FINAL_CFG["n_rounds"], "same number of rounds as the exploratory run"),
         ("games per round", FINAL_CFG["games_per_round"], "about 60k transitions per round"),
         ("behaviour ε (LSPI)", FINAL_CFG["epsilon"], "0.1 and 0.2 gave the same final value"),
         ("replay buffer", f"{FINAL_CFG['buffer_rounds']} rounds (all data)", "off-policy: old data stays valid"),
@@ -258,25 +288,24 @@ def make_figures(perf, curves, budgets, robust, theta_final):
            title="Held-out performance against the default strategy")
     _save(fig, "fig_2_4_performance_vs_default.png")
 
-    # Figure: what the final policy does (replay 20,000 games and log its choices)
-    from refine import U_GRID, V_GRID, greedy_batch
-    from refine_env import default_batch, play
-    pol = greedy_batch(theta_final); idx = []
-    _, _, log = play(pol, default_batch, 20000, seed=11, record=True,
-                     callback=lambda *a: idx.append(pol.last_idx.copy()))
+    # Figure: what the final policy does in individual games
+    from refine import U_GRID, V_GRID, greedy_batch, rollouts
+    _, _, log = rollouts(greedy_batch(theta_final), default_opponent_policy, min(20000, TEST_GAMES),
+                         seed=11, record=True)
     rec = {k: [] for k in ("t", "u", "v", "delta", "sd", "g", "R", "p")}
     for t in range(10):
         s = log[t]["state"]; a = s["B_self"] > 0
-        for k, v in (("t", np.full(a.sum(), t)), ("u", U_GRID[idx[t]][a]), ("v", V_GRID[idx[t]][a]),
+        idx = log[t]["idx"][a]
+        for k, v in (("t", np.full(a.sum(), t)), ("u", U_GRID[idx]), ("v", V_GRID[idx]),
                      ("delta", log[t]["delta"][a]), ("sd", (s["S_self"] - s["S_opp"])[a]),
-                     ("g", np.abs(s["g"][a])), ("R", s["R"][a]), ("p", log[t]["p_win"][a])):
+                     ("g", np.abs(s["g"][a])), ("R", s["R"][a]), ("p", log[t]["win"][a])):
             rec[k].append(v)
     r = {k: np.concatenate(v) for k, v in rec.items()}
     ts = np.arange(10)
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     ax = axes[0, 0]
     for key, mk, lab in [("u", "o", "speed spend δ²/B"), ("v", "s", "|x| / W (share of wealth bet)"),
-                         ("p", "^", "P(win speed race)")]:
+                         ("p", "^", "Speed race win rate")]:
         ax.plot(ts, [r[key][r["t"] == t].mean() for t in ts], marker=mk, label=lab)
     ax.set(xlabel="Period t", ylim=(0, 1.05), title="Policy over time (firms not bankrupt)"); ax.legend(fontsize=8)
     ax = axes[0, 1]
@@ -348,4 +377,10 @@ def _save(fig, name):
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Reproduce or evaluate the Group E agent.")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="evaluate the saved agent in the Section 2.1 simulator")
+    if parser.parse_args().evaluate:
+        evaluate_saved_agent()
+    else:
+        main()

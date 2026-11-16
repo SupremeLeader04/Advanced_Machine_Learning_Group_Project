@@ -25,8 +25,197 @@ Run refine_experiments.py (not this file) to train the agent / reproduce results
 """
 
 import numpy as np
+from scipy.special import ndtr
 
-from refine_env import T, default_batch, play, play_chunked, summarise, trade_gain
+from default_opponent import default_opponent_policy
+from environment import sim_game
+
+
+T = 10
+SIGMA = 1.5
+MAX_EFFECTIVE_SPEED = 350.0  # keep the supplied simulator's exp(2 * speed) finite
+STATE_KEYS = ("t", "B_self", "B_opp", "S_self", "S_opp", "g", "R")
+
+
+def rollouts(policy, opponent, n_games, seed=0, record=False):
+    """Run the Section 2.1 simulator once per game and group the resulting data."""
+    rng = np.random.default_rng(seed)
+    budgets = np.empty((n_games, 2))
+    if record:
+        trajectories = np.empty((n_games, T + 1, 13))
+        actions = np.empty((n_games, T), dtype=int)
+
+    def for_environment(candidate, capture=False):
+        if candidate is default_opponent_policy:
+            return candidate
+
+        def act(state):
+            current = {key: np.array([value]) for key, value in zip(STATE_KEYS, state)}
+            delta, x = candidate(current, rng)
+            if capture:
+                actions[game, state[0]] = candidate.last_idx[0]
+
+            budget = state[1]
+            delta = float(delta[0])
+            while delta**2 > budget:
+                delta = float(np.nextafter(delta, 0.0))
+            remaining = budget - delta**2
+            x = min(max(float(x[0]), -remaining), remaining)
+            while delta**2 + abs(x) > budget:
+                x = float(np.nextafter(x, 0.0))
+            return [delta, x]
+
+        return act
+
+    own = for_environment(policy, capture=record)
+    other = for_environment(opponent)
+    random_state = np.random.get_state()
+    try:
+        np.random.seed(seed)
+        for game in range(n_games):
+            history = sim_game(policy_1=own, policy_2=other)
+            budgets[game] = history[-1, 1:3]
+            if record:
+                trajectories[game] = history
+    finally:
+        np.random.set_state(random_state)
+
+    if not record:
+        return budgets[:, 0], budgets[:, 1]
+
+    log = []
+    for t in range(T):
+        rows = trajectories[:, t]
+        log.append(dict(state=dict(zip(STATE_KEYS, rows[:, :7].T)),
+                        idx=actions[:, t], delta=rows[:, 9], win=rows[:, 8] == 1,
+                        B_next=trajectories[:, t + 1, 1]))
+    return budgets[:, 0], budgets[:, 1], log
+
+
+# Benchmark policies and payoff calculations
+
+
+def hold_batch(st, rng):
+    """Benchmark: never invest in speed, never trade (keeps B = 100)."""
+    z = np.zeros_like(st["B_self"])
+    return z, z
+
+
+def summarise(B1, B2):
+    """Summary of firm 1's terminal budgets: mean, standard error, median, win rate."""
+    n = len(B1)
+    return dict(mean=float(B1.mean()), se=float(B1.std(ddof=1) / np.sqrt(n)),
+                median=float(np.median(B1)), win_rate=float(np.mean(B1 > B2)),
+                opp_mean=float(B2.mean()))
+
+
+DELTA_GRID = np.linspace(0, 12, 241)
+Z_NODES = (np.arange(20) + 0.5) / 20  # quadrature for opponent's Z ~ U[0,1]
+
+
+def trade_gain(g, R, f=1.0):
+    """E[max(0, 1 + f*sign(g)*Delta)] - 1 per unit of wealth, given g, R.
+
+    Given the signal, f*sign(g)*Delta ~ N(f|g|, f^2 (1-R^2) sigma^2), so
+    Y = 1 + f*sign(g)*Delta is normal with mean mu and s.d. s, and
+    E[max(0, Y)] = mu * Phi(mu/s) + s * phi(mu/s)  (mean of a normal floored at 0).
+    """
+    g = np.asarray(g, float)
+    R = np.asarray(R, float)
+    mu = 1 + f * np.abs(g)
+    s = np.maximum(f * SIGMA * np.sqrt(np.maximum(1 - R**2, 0)), 1e-9)
+    z = mu / s
+    return mu * ndtr(z) + s * np.exp(-0.5 * z**2) / np.sqrt(2 * np.pi) - 1
+
+
+def win_prob(delta, S_self, S_opp, delta_opp_scale):
+    """P(win) for own delta when the opponent invests Z*delta_opp_scale, Z~U[0,1]."""
+    d = np.asarray(delta)[:, None, None]
+    opp = S_opp[None, :, None] + delta_opp_scale[None, :, None] * Z_NODES[None, None, :]
+    z = 2 * (S_self[None, :, None] + d - opp)
+    return (1 / (1 + np.exp(-np.clip(z, -50, 50)))).mean(axis=2)
+
+
+def myopic_batch(opp_model="default", trade_f=1.0, speed_value=0.0):
+    """One-step optimal speed investment with all-in trading in direction of g.
+
+    opp_model: 'default' assumes opponent delta = Z*sqrt(B_opp);
+               'zero' assumes the opponent invests nothing this period.
+    speed_value: shadow value per unit of speed capital carried forward.
+    """
+    def policy(st, rng=None):
+        B, g, R = st["B_self"], st["g"], st["R"]
+        if opp_model == "default":
+            scale = np.sqrt(st["B_opp"])
+        else:
+            scale = np.zeros_like(B)
+        p = win_prob(DELTA_GRID, st["S_self"], st["S_opp"], scale)       # (k, n)
+        cost = DELTA_GRID[:, None] ** 2
+        W = np.maximum(B[None, :] - cost, 0)
+        G = trade_gain(g, R, trade_f)[None, :]
+        # one-period expected profit: P(win) * W * gain - speed cost (+ optional speed value)
+        value = p * W * G - cost + speed_value * DELTA_GRID[:, None]
+        value = np.where(cost <= B[None, :], value, -np.inf)   # unaffordable speeds excluded
+        k = np.argmax(value, axis=0)           # best delta on the grid, per game
+        delta = DELTA_GRID[k]
+        W = np.maximum(B - delta**2, 0)
+        x = np.sign(g) * trade_f * W
+        return delta, x
+    return policy
+
+
+def allin_nospeed(st, rng=None):
+    """Opponent type: no speed investment, bets the whole budget on sign(g)."""
+    z = np.zeros_like(st["B_self"])
+    return z, np.sign(st["g"]) * st["B_self"]
+
+
+def const_speed(delta_level, trade_f=1.0):
+    """Invest a fixed delta every period (if affordable) and bet trade_f of wealth on sign(g)."""
+    def policy(st, rng):
+        B = st["B_self"]
+        d = np.minimum(delta_level, np.sqrt(B))
+        return d, np.sign(st["g"]) * trade_f * (B - d**2)
+    return policy
+
+
+class Mixture:
+    """Each game is assigned one opponent from the pool for its whole duration."""
+    def __init__(self, pool, weights=None):
+        """pool: list of batched policies; weights: relative sampling weights."""
+        self.pool = pool
+        self.w = np.ones(len(pool)) / len(pool) if weights is None else np.asarray(weights) / np.sum(weights)
+        self.assign = None
+
+    def __call__(self, st, rng):
+        """Act for every game with that game's assigned opponent."""
+        n = len(st["B_self"])
+        # draw a fresh assignment at the start of each batch of games
+        if int(st["t"][0]) == 0 or self.assign is None or len(self.assign) != n:
+            self.assign = rng.choice(len(self.pool), size=n, p=self.w)
+        d = np.zeros(n); x = np.zeros(n)
+        for k, pol in enumerate(self.pool):
+            m = self.assign == k
+            if m.any():
+                sub = {kk: v[m] for kk, v in st.items()}
+                if pol is default_opponent_policy:
+                    states = zip(*(sub[key] for key in STATE_KEYS))
+                    d[m], x[m] = np.array([pol(list(state)) for state in states]).T
+                else:
+                    d[m], x[m] = pol(sub, rng)
+        return d, x
+
+
+def standard_pool():
+    """Opponent types used for the robustness checks and pool training."""
+    return {
+        "default": default_opponent_policy,
+        "hold cash": hold_batch,
+        "all-in, no speed": allin_nospeed,
+        "one-step look-ahead": myopic_batch("default"),
+        "const speed 2": const_speed(2.0),
+        "const speed 5": const_speed(5.0),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -89,18 +278,23 @@ H_NAMES = ["kept wealth (1-u)",
 FEATURE_SET = "economic"
 
 
+def _speed_investment(budget, speed, fraction):
+    return np.minimum(np.sqrt(fraction * budget), np.maximum(MAX_EFFECTIVE_SPEED - speed, 0))
+
+
 def action_terms(st, u, v):
     """h(s, a) for every state (n) and every candidate action (k): shape (n, k, H)."""
+    B = st["B_self"][:, None]
+    delta = _speed_investment(B, st["S_self"][:, None], u[None, :])
+    spend = np.divide(delta**2, B, out=np.zeros_like(delta), where=B > 0)
     if FEATURE_SET == "plain":
         n = len(st["B_self"])
-        uu = np.broadcast_to(u[None, :], (n, len(u)))
+        uu = spend
         vv = np.broadcast_to(v[None, :], (n, len(v)))
         return np.stack([np.ones_like(uu), uu, vv, uu * uu, vv * vv, uu * vv], axis=2)
-    B = st["B_self"][:, None]
-    delta = np.sqrt(u[None, :] * B)          # speed investment implied by u = delta^2 / B
-    kept = np.broadcast_to(1 - u[None, :], delta.shape)   # share of wealth left after speed cost
+    kept = 1 - spend
     # expected one-period return per unit of wealth when betting share f on sign(g)
-    gain = np.stack([trade_gain(st["g"], st["R"], f) for f in TRADE_FRACS], 1)  # (n, 11)
+    gain = trade_gain(st["g"][:, None], st["R"][:, None], TRADE_FRACS)
     gv = gain[:, np.round(v * 10).astype(int)]  # pick the gain for each action's trade share v
     # win probabilities against a default-like and a passive opponent
     p_def = _p_win(delta, st, np.sqrt(st["B_opp"]))
@@ -156,7 +350,7 @@ def actions_from_index(st, idx):
     """
     u, v = U_GRID[idx], V_GRID[idx]
     B = st["B_self"]
-    delta = np.sqrt(u * B)
+    delta = _speed_investment(B, st["S_self"], u)
     x = np.sign(st["g"]) * v * (B - delta**2)
     return delta, x
 
@@ -168,11 +362,19 @@ def greedy_batch(theta, epsilon=0.0):
     """Batched (epsilon-)greedy policy w.r.t. the linear Q-function with weights theta."""
     def policy(st, rng):
         n, chunk = len(st["B_self"]), 4000
+        if n == 1:
+            if st["B_self"][0] == 0:
+                policy.last_idx = np.zeros(1, dtype=int)
+                return actions_from_index(st, policy.last_idx)
+            if epsilon and rng.random() < epsilon:
+                policy.last_idx = rng.integers(N_ACTIONS, size=1)
+                return actions_from_index(st, policy.last_idx)
+
         idx = np.empty(n, dtype=int)
         for s in range(0, n, chunk):           # chunks keep memory small for many games
             z, h = phi_all(_sub(st, np.arange(n)[s:s + chunk]))
             idx[s:s + chunk] = np.argmax(q_all(_th(theta, st), z, h), axis=1)
-        if epsilon > 0:                        # explore: uniformly random grid action
+        if epsilon > 0 and n > 1:              # single-state exploration is handled above
             explore = rng.uniform(size=len(idx)) < epsilon
             idx = np.where(explore, rng.integers(0, N_ACTIONS, len(idx)), idx)
         policy.last_idx = idx                  # remembered so collect() can log the actions
@@ -192,19 +394,13 @@ def collect(theta, epsilon, opponent, n_games, seed):
     # first round (theta None): a purely random behaviour policy
     pol = greedy_batch(theta if theta is not None else np.zeros(N_PARAMS),
                        epsilon if theta is not None else 1.0)
-    idx_log = []
-
-    def cb(t, st, a, win, B_next):
-        """Record which grid action was taken in each period."""
-        idx_log.append(pol.last_idx.copy())
-
-    B1, B2, log = play(pol, opponent, n_games, seed=seed, record=True, callback=cb)
+    B1, B2, log = rollouts(pol, opponent, n_games, seed=seed, record=True)
     data = []
     for t in range(T):
         st = log[t]["state"]
         alive = st["B_self"] > 0
         sa = _sub(st, alive)
-        idx = idx_log[t][alive]
+        idx = log[t]["idx"][alive]
         h_sel = _h_chosen(sa, idx)
         rho = log[t]["B_next"][alive] / st["B_self"][alive]   # wealth ratio B_{t+1} / B_t
         item = dict(z=state_features_batch(sa).astype(np.float32),
@@ -274,7 +470,7 @@ def lstdq(data, theta, ridge=1e-3):
     return np.linalg.solve(A, b)
 
 
-def train_lspi(opponent=default_batch, n_rounds=8, games_per_round=4000,
+def train_lspi(opponent=default_opponent_policy, n_rounds=8, games_per_round=4000,
                epsilon=0.2, buffer_rounds=4, seed=0, eval_games=20000, verbose=True):
     """LSPI: alternate data collection (epsilon-greedy) and LSTDQ policy iteration."""
     theta = None
@@ -328,7 +524,7 @@ def fit_backward(buffer, ridge=1.0, theta_init=None):
     return theta
 
 
-def train_backward(opponent=default_batch, n_rounds=6, games_per_round=8000,
+def train_backward(opponent=default_opponent_policy, n_rounds=6, games_per_round=8000,
                    epsilon=0.2, buffer_rounds=6, ridge=1.0, seed=0,
                    eval_games=20000, verbose=True, opponent_factory=None):
     """Finite-horizon LSPI: collect epsilon-greedy data, refit backwards, repeat.
@@ -358,7 +554,7 @@ def train_backward(opponent=default_batch, n_rounds=6, games_per_round=8000,
 # ---------------------------------------------------------------------------
 # Incremental Q-learning (Lecture 4 + semi-gradient linear VFA, Lecture 5)
 # ---------------------------------------------------------------------------
-def train_qlearning(opponent=default_batch, n_batches=60, games_per_batch=500,
+def train_qlearning(opponent=default_opponent_policy, n_batches=60, games_per_batch=500,
                     alpha0=0.02, eps0=0.3, eps_min=0.05, seed=0, eval_every=10,
                     eval_games=20000, verbose=True):
     """Semi-gradient Q-learning on the normalised Q, updates per transition batch.
@@ -394,7 +590,7 @@ def train_qlearning(opponent=default_batch, n_batches=60, games_per_batch=500,
 
 def evaluate(theta, opponent, n_games=20000, seed=777):
     """Mean/median terminal budget of the greedy policy over n_games (fixed seed)."""
-    B1, B2 = play_chunked(greedy_batch(theta), opponent, n_games, seed=seed)
+    B1, B2 = rollouts(greedy_batch(theta), opponent, n_games, seed=seed)
     return summarise(B1, B2)
 
 
@@ -456,7 +652,7 @@ def ac_policy(model, greedy=False):
 
 
 def train_ac(n_updates=12000, games=512, lr=1e-3, entropy=0.003, clip_return=1000.0,
-             seed=0, opponent=default_batch, eval_every=1200, eval_games=10000, verbose=True):
+             seed=0, opponent=default_opponent_policy, eval_every=1200, eval_games=10000, verbose=True):
     """Advantage actor-critic with Monte-Carlo returns per unit of wealth, rho = B_T / B_t.
 
     Mirrors mini-problem set 6: shared layer + actor head (softmax action
@@ -476,9 +672,7 @@ def train_ac(n_updates=12000, games=512, lr=1e-3, entropy=0.003, clip_return=100
     for k in range(n_updates):
         # 1) play a batch of games with the current stochastic policy
         pol = ac_policy(model)
-        idx_log = []
-        _, _, log = play(pol, opponent, games, seed=seed * 100000 + k, record=True,
-                         callback=lambda *a: idx_log.append(pol.last_idx.copy()))
+        _, _, log = rollouts(pol, opponent, games, seed=seed * 100000 + k, record=True)
         # 2) Monte-Carlo return of every visited state, per unit of wealth: B_T / B_t
         BT = log[-1]["B_next"]
         X, A, G = [], [], []
@@ -486,7 +680,7 @@ def train_ac(n_updates=12000, games=512, lr=1e-3, entropy=0.003, clip_return=100
             st = log[t]["state"]
             alive = st["B_self"] > 0
             X.append(ac_inputs({kk: v[alive] for kk, v in st.items()}))
-            A.append(idx_log[t][alive])
+            A.append(log[t]["idx"][alive])
             G.append(np.minimum(BT[alive] / st["B_self"][alive], clip_return))  # return per unit of wealth
         X = torch.from_numpy(np.vstack(X)); A = torch.from_numpy(np.concatenate(A)).long()
         G = torch.from_numpy(np.concatenate(G).astype(np.float32))
@@ -501,7 +695,7 @@ def train_ac(n_updates=12000, games=512, lr=1e-3, entropy=0.003, clip_return=100
         loss = actor_loss + critic_loss - entropy * ent
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         if (k + 1) % eval_every == 0:
-            r = summarise(*play_chunked(ac_policy(model, greedy=True), opponent, eval_games, seed=777))
+            r = summarise(*rollouts(ac_policy(model, greedy=True), opponent, eval_games, seed=777))
             curve.append((k + 1, r))
             if verbose:
                 print(f"AC update {k + 1}: greedy mean B10 {r['mean']:.0f} ± {r['se']:.0f}, "

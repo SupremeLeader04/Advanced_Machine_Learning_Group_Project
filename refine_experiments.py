@@ -35,8 +35,8 @@ AGENT_FILE = Path("rlagent") / "agentE_theta.npy"
 FINAL_CFG = dict(n_rounds=6, games_per_round=6000, epsilon=0.1, ridge=1.0,
                  buffer_rounds=6, seed=0, eval_games=2000)
 EXTRA_SEEDS = [1, 2, 3, 4]
-AC_CFG = dict(n_updates=12000, games=512, lr=1e-3, entropy=0.003, clip_return=1000.0,
-              seed=0, eval_every=1200, eval_games=10000)
+AC_CFG = dict(n_updates=3000, games=256, lr=1e-3, entropy=0.003, clip_return=1000.0,
+              seed=0, eval_every=300, eval_games=5000)   # 12,000 x 512 would take ~7 h on a CPU
 QL_CFG = dict(n_batches=60, games_per_batch=1000, alpha0=0.05, eps0=0.3,
               eps_min=0.05, eval_every=10, eval_games=10000, seed=7)
 POOL_CFG = dict(n_rounds=8, games_per_round=6000, epsilon=0.1, ridge=1.0,
@@ -225,7 +225,7 @@ def write_tuning_table():
          "as in mini-problem set 6; inputs: 9 scaled state variables + 50 indicators"),
         ("actor-critic training", f"{AC_CFG['n_updates']} updates × {AC_CFG['games']} games, Adam "
          f"lr {AC_CFG['lr']}/(1+5k/K), entropy {AC_CFG['entropy']}",
-         "longer training / larger batches (2,048) gave the same value"),
+         "decreasing step size; sized to run in about an hour on a CPU"),
         ("actor-critic return", f"ρ = B_T/B_t clipped at {AC_CFG['clip_return']:g}; standardised advantage; Huber critic",
          "per-unit-wealth return as for LSPI; clipping limits rare huge returns"),
         ("pool training weights", "default 3, hold 1, all-in 1, look-ahead 1, const-speed-2 1, "
@@ -269,7 +269,7 @@ def make_figures(perf, curves, budgets, robust, theta_final):
     axes[0].set(xlabel="LSPI round (6,000 new ε-greedy games per round)",
                 ylabel="Greedy mean terminal budget vs default", title="Batch control: finite-horizon LSPI")
     axes[1].set(xlabel="Q-learning batch (1,000 games per batch)", title="Incremental Q-learning")
-    axes[2].set(xlabel="Actor-critic update (512 games per update)", title="Actor-critic (neural network)")
+    axes[2].set(xlabel=f"Actor-critic update ({AC_CFG['games']} games per update)", title="Actor-critic (neural network)")
     _save(fig, "fig_2_4_learning_curves.png")
 
     # Figure: held-out performance of every policy against the default

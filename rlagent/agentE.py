@@ -120,6 +120,10 @@ def policy(t, B_self, B_opp, S_self, S_opp, g, R):
         delta = float(np.nextafter(delta, 0.0))
     W = B_self - delta**2
     x = float(np.sign(g) * V_GRID[k] * W)
-    while delta**2 + abs(x) > B_self:
+    for _ in range(1000):              # a few rounding steps are normally enough
+        if delta**2 + abs(x) <= B_self:
+            break
         x = float(np.nextafter(x, 0.0))
+    else:                              # |x| is negligibly small: trade nothing
+        x = 0.0
     return delta, x

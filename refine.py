@@ -29,6 +29,7 @@ from scipy.special import ndtr
 
 from default_opponent import default_opponent_policy
 from environment import sim_game
+from features import state_features
 
 
 T = 10
@@ -61,8 +62,12 @@ def rollouts(policy, opponent, n_games, seed=0, record=False):
                 delta = float(np.nextafter(delta, 0.0))
             remaining = budget - delta**2
             x = min(max(float(x[0]), -remaining), remaining)
-            while delta**2 + abs(x) > budget:
+            for _ in range(1000):          # a few rounding steps are normally enough
+                if delta**2 + abs(x) <= budget:
+                    break
                 x = float(np.nextafter(x, 0.0))
+            else:                          # |x| is negligibly small: trade nothing
+                x = 0.0
             return [delta, x]
 
         return act
@@ -232,34 +237,10 @@ N_ACTIONS = len(U_GRID)
 # ---------------------------------------------------------------------------
 # State features: same 50 indicators as features.state_features, vectorised
 # ---------------------------------------------------------------------------
-def _onehot(idx, k):
-    """One-hot rows: column idx[i] of row i is 1, all others 0."""
-    out = np.zeros((len(idx), k))
-    out[np.arange(len(idx)), idx] = 1
-    return out
-
-
 def state_features_batch(st):
-    """Vectorised version of features.state_features (identical bins).
-
-    Returns an (n, 50) matrix: time (5) | own budget (8) | opponent budget (8) |
-    speed difference (7) | informativeness R (10) | sign of g (3) | |g| (9).
-    """
-    t = st["t"].astype(int)
-    d = st["S_self"] - st["S_opp"]
-    # speed-difference bins (-inf,-5), [-5,-3), [-3,0), {0}, (0,3), [3,5), [5,inf)
-    sp = np.select([d < -5, d < -3, d < 0, d == 0, d < 3, d < 5],
-                   [0, 1, 2, 3, 4, 5], 6)
-    g = st["g"]
-    return np.hstack([
-        _onehot(t // 2, 5),
-        _onehot(np.searchsorted([20, 40, 60, 80, 100, 120, 150], st["B_self"], "right"), 8),
-        _onehot(np.searchsorted([20, 40, 60, 80, 100, 120, 150], st["B_opp"], "right"), 8),
-        _onehot(sp, 7),
-        _onehot(np.searchsorted(np.arange(1, 10) / 10, st["R"], "right"), 10),
-        _onehot(np.select([g < 0, g == 0], [0, 1], 2), 3),
-        _onehot(np.searchsorted([.5, 1, 1.5, 2, 2.5, 3, 4, 10], np.abs(g), "right"), 9),
-    ])
+    """The group's 50 state indicators (features.state_features) for a batch of states."""
+    rows = zip(*(st[k] for k in ("t", "B_self", "B_opp", "S_self", "S_opp", "g", "R")))
+    return np.array([state_features(list(r)) for r in rows], dtype=float).reshape(-1, 50)
 
 
 # ---------------------------------------------------------------------------

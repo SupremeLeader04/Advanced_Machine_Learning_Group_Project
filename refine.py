@@ -249,7 +249,7 @@ N_ACTIONS = len(U_GRID)
 
 
 # ---------------------------------------------------------------------------
-# State features: same 50 indicators as features.state_features, vectorised
+# State features: same 50 indicators as features.state_features (computed by calling it)
 # ---------------------------------------------------------------------------
 def state_features_batch(st):
     """The group's 50 state indicators (features.state_features) for a batch of states."""

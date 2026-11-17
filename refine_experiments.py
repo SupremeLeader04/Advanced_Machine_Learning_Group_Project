@@ -42,7 +42,7 @@ QL_CFG = dict(n_batches=60, games_per_batch=1000, alpha0=0.05, eps0=0.3,
 POOL_CFG = dict(n_rounds=8, games_per_round=6000, epsilon=0.1, ridge=1.0,
                 buffer_rounds=6, seed=50, eval_games=20000)
 FP_CFG = dict(POOL_CFG, seed=90)
-TEST_SEED, TEST_GAMES = 4242, 50000      # held-out evaluation vs default
+TEST_SEED, TEST_GAMES = 4242, 50000      # common evaluation games vs default
 ROBUST_SEED, ROBUST_GAMES = 31, 8000     # robustness matrix (per cell)
 
 # REFINE_QUICK=1 shrinks everything for a fast smoke test (results not meaningful)
@@ -145,7 +145,7 @@ def run_experiments(theta_final, curve_final):
               "LSPI fictitious play": greedy_batch(th_fp),
               "Q-learning (incremental)": greedy_batch(th_ql)}
 
-    # 3) held-out performance against the default (same 50,000 test games for all)
+    # 3) performance against the default (same 50,000 test games for all)
     rows, budgets = [], {}
     bench = {"Default (firm 1 also default)": default_opponent_policy, "Hold cash": hold_batch,
              "One-step look-ahead (model-based)": myopic_batch("default")}
@@ -213,7 +213,7 @@ def write_tuning_table():
         ("trade grid v = |x|/W", ", ".join(f"{x:g}" for x in TRADE_FRACS), "as in 2.3; direction = sign(g)"),
         ("action terms h(s,a)", " | ".join(H_NAMES), "interacted with the 50 state indicators of 2.3.1"),
         ("Q scaling", "Q = B_t · θ_t'φ", "value roughly proportional to wealth; target ratio ρ = B_{t+1}/B_t"),
-        ("LSPI rounds", FINAL_CFG["n_rounds"], "same number of rounds as the exploratory run"),
+        ("LSPI rounds", FINAL_CFG["n_rounds"], "value curve flat after round 2"),
         ("games per round", FINAL_CFG["games_per_round"], "about 42k transitions per round"),
         ("behaviour ε (LSPI)", FINAL_CFG["epsilon"], "keeps most data on the greedy path"),
         ("replay buffer", f"{FINAL_CFG['buffer_rounds']} rounds (all data)", "off-policy: old data stays valid"),
@@ -290,7 +290,7 @@ def fig_learning_curves(curves, ref):
 
 
 def fig_performance(perf):
-    """Figure: held-out performance of every policy against the default."""
+    """Figure: performance of every policy against the default."""
     plt = _plt()
     blue, grey = BLUE, GREY
     p = sorted(perf, key=lambda r: r["mean"])

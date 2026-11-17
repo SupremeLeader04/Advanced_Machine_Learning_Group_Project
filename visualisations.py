@@ -47,6 +47,42 @@ def mean_by_group( #divide obs into groups and calculate the average value of a 
     return result
 
 
+def save_csv(path: str | Path, rows: list[dict]) -> None:
+    """Write experiment rows to CSV, using the first row's keys as columns."""
+    if not rows:
+        raise ValueError("Cannot save an empty CSV result.")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _bootstrap_mean_interval(
+    values: np.ndarray,
+    seed: int,
+    n_resamples: int = 5000,
+) -> tuple[float, float]:
+    """Return a reproducible percentile-bootstrap interval for a sample mean."""
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 1 or len(values) < 2 or not np.all(np.isfinite(values)):
+        raise ValueError("values must be a finite vector with at least two observations.")
+    if n_resamples < 1:
+        raise ValueError("n_resamples must be positive.")
+
+    rng = np.random.default_rng(seed)
+    means = np.empty(n_resamples, dtype=float)
+    batch_size = 250
+    for start in range(0, n_resamples, batch_size):
+        stop = min(start + batch_size, n_resamples)
+        indices = rng.integers(0, len(values), size=(stop - start, len(values)))
+        means[start:stop] = values[indices].mean(axis=1)
+
+    lower, upper = np.quantile(means, [0.025, 0.975])
+    return float(lower), float(upper)
+
+
 def plot_strategy(
     mc_samples: list[dict],
     td_samples: list[dict],
@@ -128,6 +164,217 @@ def plot_strategy(
 
     fig.tight_layout()
     fig.savefig(output_dir / "learned_strategy.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_control_tuning_heatmaps(
+    alpha_values: dict,
+    epsilon_values: list[float],
+    scores: dict,
+    output_dir: str | Path,
+    stage: str = "screening",
+) -> None:
+    """Plot validation wealth for screening or shortlisted refinement runs."""
+    if stage not in ("screening", "refinement"):
+        raise ValueError("stage must be 'screening' or 'refinement'.")
+    plt.switch_backend("Agg")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharey=False)
+    score_arrays = [
+        np.asarray(scores[method], dtype=float)
+        for method in ("MC", "SARSA")
+    ]
+    finite_scores = np.concatenate([
+        values[np.isfinite(values)] for values in score_arrays
+    ])
+    if finite_scores.size == 0:
+        raise ValueError("At least one finite tuning score is required.")
+    vmin = float(finite_scores.min())
+    vmax = float(finite_scores.max())
+    if vmin == vmax:
+        vmax = vmin + 1.0
+
+    for ax, method in zip(axes, ("MC", "SARSA")):
+        values = np.asarray(scores[method])
+        image = ax.imshow(
+            np.ma.masked_invalid(values),
+            aspect="auto",
+            origin="lower",
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set(
+            title=f"{method} {stage} validation wealth",
+            xlabel="Initial exploration rate (epsilon_0)",
+            ylabel="Initial step size (alpha_0)",
+            xticks=np.arange(len(epsilon_values)),
+            xticklabels=[f"{value:g}" for value in epsilon_values],
+            yticks=np.arange(len(alpha_values[method])),
+            yticklabels=[f"{value:g}" for value in alpha_values[method]],
+        )
+        for i in range(values.shape[0]):
+            for j in range(values.shape[1]):
+                if not np.isfinite(values[i, j]):
+                    continue
+                label = (
+                    f"{values[i, j]:.1f}"
+                    if abs(values[i, j]) >= 1
+                    else f"{values[i, j]:.2g}"
+                )
+                ax.text(
+                    j,
+                    i,
+                    label,
+                    ha="center",
+                    va="center",
+                    color=(
+                        "black"
+                        if np.dot(
+                            plt.get_cmap("viridis")(
+                                (values[i, j] - vmin) / (vmax - vmin)
+                            )[:3],
+                            [0.2126, 0.7152, 0.0722],
+                        ) > 0.55
+                        else "white"
+                    ),
+                )
+    fig.subplots_adjust(left=0.09, right=0.88, bottom=0.16, top=0.9, wspace=0.3)
+    colorbar_ax = fig.add_axes([0.91, 0.2, 0.025, 0.65])
+    fig.colorbar(image, cax=colorbar_ax, label="Mean terminal wealth")
+    filename = (
+        "control_hyperparameter_heatmaps.png"
+        if stage == "screening"
+        else "control_hyperparameter_refinement.png"
+    )
+    fig.savefig(output_dir / filename, dpi=200)
+    plt.close(fig)
+
+
+def plot_control_schedules(
+    episodes: np.ndarray,
+    learning_rates: dict[str, list[float]],
+    exploration_rates: dict[str, list[float]],
+    output_dir: str | Path,
+) -> None:
+    """Plot the selected learning and exploration schedules for each method."""
+    plt.switch_backend("Agg")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+    for method in ("MC", "SARSA"):
+        axes[0].plot(episodes, learning_rates[method], label=method)
+        axes[1].plot(episodes, exploration_rates[method], label=method)
+
+    axes[0].set(
+        xlabel="Training episode",
+        ylabel="Step size alpha",
+        title="Selected learning-rate schedules",
+    )
+    axes[1].set(
+        xlabel="Training episode",
+        ylabel="Exploration rate epsilon",
+        title="Selected exploration schedules",
+    )
+    for ax in axes:
+        ax.grid(alpha=0.25)
+        ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "control_schedules.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_control_final_comparison(
+    test_wealth: dict[str, np.ndarray],
+    output_dir: str | Path,
+) -> None:
+    """Compare test-game mean wealth and show uncertainty separately from dispersion."""
+    plt.switch_backend("Agg")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    methods = ("MC", "SARSA")
+    colors = ["#1f77b4", "#ff7f0e"]
+    interval_upper = 100.0
+    for position, (method, color) in enumerate(zip(methods, colors), start=1):
+        values = np.asarray(test_wealth[method], dtype=float)
+        if values.ndim != 1 or len(values) < 2 or not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"{method} test wealth must be a finite vector with at least two games."
+            )
+
+        mean = float(values.mean())
+        median = float(np.median(values))
+        sd = float(values.std(ddof=1))
+        lower, upper = _bootstrap_mean_interval(values, seed=2026 + position)
+        ax.vlines(position, lower, upper, color=color, linewidth=2)
+        ax.hlines([lower, upper], position - 0.035, position + 0.035, color=color)
+        ax.scatter(
+            position,
+            mean,
+            color=color,
+            marker="o",
+            s=55,
+            zorder=3,
+            label="Mean (95% bootstrap interval)" if position == 1 else None,
+        )
+        ax.scatter(
+            position,
+            median,
+            color=color,
+            marker="D",
+            s=40,
+            edgecolor="white",
+            linewidth=0.7,
+            zorder=4,
+            label="Median" if position == 1 else None,
+        )
+        interval_upper = max(interval_upper, upper)
+        ax.text(
+            position,
+            0.97,
+            (
+                f"Mean {mean:.1f}  |  Median {median:.1f}\n"
+                f"SD {sd:.1f}  |  Max {values.max():.1f}\n"
+                f"Games {len(values)}"
+            ),
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=9,
+        )
+
+    ax.axhline(
+        100.0,
+        linestyle=":",
+        color="black",
+        linewidth=1.2,
+        label="Hold cash: terminal wealth = 100",
+    )
+    y_max = max(125.0, interval_upper * 1.12)
+    ax.set(
+        xticks=np.arange(1, len(methods) + 1),
+        xticklabels=methods,
+        xlim=(0.5, len(methods) + 0.5),
+        xlabel="Control method",
+        ylabel="Mean terminal wealth",
+        title="Held-out control performance",
+        ylim=(80.0, y_max),
+    )
+    ax.legend(loc="lower right")
+    ax.grid(axis="y", alpha=0.25)
+    fig.text(
+        0.5,
+        0.015,
+        "Whiskers: 95% percentile-bootstrap interval for the mean. SD describes test-game spread.",
+        ha="center",
+        fontsize=9,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(output_dir / "control_final_comparison.png", dpi=200)
     plt.close(fig)
 
 
@@ -215,7 +462,7 @@ def regenerate_learning_rate_sensitivity(
 
 def plot_control_learning_curves(
     checkpoints: np.ndarray,
-    learning_curves: dict,
+    learning_curves: dict[str, np.ndarray],
     default_curve_mean: float | None,
     features: str,
     output_dir: Path
@@ -274,7 +521,14 @@ def plot_control_learning_curves(
     ax.legend()
     ax.grid(alpha=0.25)
 
-    fig.tight_layout()
+    fig.text(
+        0.5,
+        0.015,
+        "Shading: ±1 SD across training seeds (not a confidence interval).",
+        ha="center",
+        fontsize=9,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
     fig.savefig(
         output_dir / "control_learning_curves.png",
         dpi=200

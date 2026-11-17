@@ -120,7 +120,7 @@ def run_experiments(theta_final, curve_final):
     th_plain, _ = train_backward(**FINAL_CFG, verbose=False)
     b1, b2 = rollouts(greedy_batch(th_plain), default_opponent_policy, TEST_GAMES, seed=TEST_SEED)
     refine.FEATURE_SET = "economic"
-    ablation_row = dict(name="LSPI finite-horizon, 2.3 action features (ablation)",
+    ablation_row = dict(name="LSPI finite-horizon, quadratic action features (ablation)",
                         **summarise(b1, b2), p_zero=float(np.mean(b1 == 0)),
                         p_above_100=float(np.mean(b1 > 100)))
 
@@ -177,19 +177,18 @@ def run_experiments(theta_final, curve_final):
 
 
 def evaluate_23_baselines(n_games=2000):
-    """Train and evaluate the group's 2.3 MC and SARSA agents (control.py)."""
+    """Train and evaluate the baseline MC and SARSA agents supported by control.py."""
     import control
     rows = []
+    n_ep = 3000 if not os.environ.get("REFINE_QUICK") else 50
     for method, alpha in (("MC", 0.001), ("SARSA", 0.005)):
-        for feats in ("baseline", "quadratic"):
-            n_ep = 3000 if not os.environ.get("REFINE_QUICK") else 50
-            theta, _, _ = control.train_control(method, feats, n_ep, 123, n_ep, 20, alpha)
-            r = control.evaluate_policy(theta, feats, n_games, seed=TEST_SEED)
-            rows.append(dict(name=f"2.3 {method} ({feats} features)", mean=r["mean"],
-                             se=r["se"], median=r["median"], win_rate=r["win_rate"],
-                             opp_mean=float(np.mean(r["opponent"])),
-                             p_zero=float(np.mean(r["own"] == 0)),
-                             p_above_100=float(np.mean(r["own"] > 100))))
+        theta, _, _ = control.train_control(method, "baseline", n_ep, 123, n_ep, 20, alpha)
+        r = control.evaluate_policy(theta, "baseline", n_games, seed=TEST_SEED)
+        rows.append(dict(name=f"2.3 {method} (baseline features)", mean=r["mean"],
+                         se=r["se"], median=r["median"], win_rate=r["win_rate"],
+                         opp_mean=float(np.mean(r["opponent"])),
+                         p_zero=float(np.mean(r["own"] == 0)),
+                         p_above_100=float(np.mean(r["own"] > 100))))
     return rows
 
 

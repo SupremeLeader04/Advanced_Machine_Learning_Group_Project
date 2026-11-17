@@ -237,15 +237,31 @@ def write_tuning_table():
 # ---------------------------------------------------------------------------
 # Figures
 # ---------------------------------------------------------------------------
-def make_figures(perf, curves, budgets, robust, theta_final):
-    """Draw the five 2.4 figures from the experiment results."""
+def _plt():
+    """Matplotlib without a display (figures are only saved to files)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    blue, grey = "#1f77b4", "#7f7f7f"
-    ref = {r["name"]: r["mean"] for r in perf}
+    return plt
 
-    # Figure: learning curves (greedy-policy value during training)
+
+BLUE, GREY = "#1f77b4", "#7f7f7f"
+
+
+def make_figures(perf, curves, budgets, robust, theta_final):
+    """Draw the five 2.4 figures from the experiment results."""
+    ref = {r["name"]: r["mean"] for r in perf}
+    fig_learning_curves(curves, ref)
+    fig_performance(perf)
+    fig_policy(theta_final)
+    fig_wealth(budgets)
+    fig_robustness(robust)
+
+
+def fig_learning_curves(curves, ref):
+    """Figure: learning curves (greedy-policy value during training)."""
+    plt = _plt()
+    blue, grey = BLUE, GREY
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), sharey=True)
     for key, lab, col in [("final", "LSPI finite-horizon (vs default) – final", blue),
                           ("pool", "LSPI pool-trained", "#ff7f0e"),
@@ -272,7 +288,11 @@ def make_figures(perf, curves, budgets, robust, theta_final):
     axes[2].set(xlabel=f"Actor-critic update ({AC_CFG['games']} games per update)", title="Actor-critic (neural network)")
     _save(fig, "fig_2_4_learning_curves.png")
 
-    # Figure: held-out performance of every policy against the default
+
+def fig_performance(perf):
+    """Figure: held-out performance of every policy against the default."""
+    plt = _plt()
+    blue, grey = BLUE, GREY
     p = sorted(perf, key=lambda r: r["mean"])
     fig, ax = plt.subplots(figsize=(9, 5.5))
     names = [r["name"] for r in p]
@@ -288,7 +308,10 @@ def make_figures(perf, curves, budgets, robust, theta_final):
            title="Held-out performance against the default strategy")
     _save(fig, "fig_2_4_performance_vs_default.png")
 
-    # Figure: what the final policy does in individual games
+
+def fig_policy(theta_final):
+    """Figure: what the final policy does in individual games."""
+    plt = _plt()
     from refine import U_GRID, V_GRID, greedy_batch, rollouts
     _, _, log = rollouts(greedy_batch(theta_final), default_opponent_policy, min(20000, TEST_GAMES),
                          seed=11, record=True)
@@ -330,7 +353,11 @@ def make_figures(perf, curves, budgets, robust, theta_final):
         a.grid(alpha=.25)
     _save(fig, "fig_2_4_policy.png")
 
-    # Figure: distribution of terminal wealth and of tournament-sized averages
+
+def fig_wealth(budgets):
+    """Figure: distribution of terminal wealth and of tournament-sized averages."""
+    plt = _plt()
+    blue, grey = BLUE, GREY
     bf, bl = budgets["LSPI finite-horizon (final)"], budgets["One-step look-ahead (model-based)"]
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     for arr, lab, col in [(bf, "LSPI final", blue), (bl, "One-step look-ahead", "k")]:
@@ -351,7 +378,10 @@ def make_figures(perf, curves, budgets, robust, theta_final):
         a.grid(alpha=.25)
     _save(fig, "fig_2_4_wealth_distribution.png")
 
-    # Figure: robustness heat map (agents x opponents)
+
+def fig_robustness(robust):
+    """Figure: robustness heat map (agents x opponents)."""
+    plt = _plt()
     rows_ = list(dict.fromkeys(r["agent"] for r in robust))
     cols_ = list(dict.fromkeys(r["opponent"] for r in robust))
     M = np.array([[next(x["mean"] for x in robust if x["agent"] == a and x["opponent"] == o)

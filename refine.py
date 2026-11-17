@@ -17,11 +17,25 @@ Bellman equation divided by B_t reads
 with theta' phi(s, a) = E[rho] in the last period. This is still linear value
 function approximation; the scaling only changes the features (B_t * phi).
 
-Also contains train_lspi (shared weights across periods), which oscillated
-between rounds and is kept for the write-up's discussion, and train_backward,
-the finite-horizon LSPI used for the final agent.
+Contents (in order):
+  rollouts, summarise         play games with the group's environment.sim_game
+  trade_gain, myopic_batch,   closed-form expected trading gain, one-step
+  standard_pool, Mixture      look-ahead benchmark and the opponent types
+  state_features_batch,       the group's features.state_features plus the six
+  action_terms, greedy_batch  action terms; the greedy (epsilon-greedy) policy
+  collect                     epsilon-greedy data for the replay buffer
+  train_lspi                  LSPI with shared weights (oscillates; reported in
+                              the write-up, not run by refine_experiments.py)
+  fit_backward,               finite-horizon LSPI: the final agent
+  train_backward
+  train_qlearning             incremental Q-learning
+  train_ac                    actor-critic network (needs PyTorch)
 
-Run refine_experiments.py (not this file) to train the agent / reproduce results.
+Policies take a dict of state arrays, a leftover of batch evaluation; with
+sim_game they are always called with one state at a time.
+
+Run refine_experiments.py (not this file) to train the agent / reproduce results,
+and test_refine.py to check the code.
 """
 
 import numpy as np

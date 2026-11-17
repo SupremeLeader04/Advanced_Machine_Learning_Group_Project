@@ -457,7 +457,7 @@ def train_lspi(opponent=default_opponent_policy, n_rounds=8, games_per_round=400
     theta = None
     buffer, curve = [], []
     for r in range(n_rounds):
-        data, behav = collect(theta, epsilon, opponent, games_per_round, seed + 1000 * r)
+        data, _ = collect(theta, epsilon, opponent, games_per_round, seed + 1000 * r)
         buffer = (buffer + [data])[-buffer_rounds:]
         flat = [d for chunk in buffer for d in chunk]
         th = np.zeros(N_PARAMS) if theta is None else theta

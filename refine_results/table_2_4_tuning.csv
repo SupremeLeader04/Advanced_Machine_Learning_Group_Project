@@ -5,8 +5,8 @@ trade grid v = |x|/W,"0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1",as in 2
 "action terms h(s,a)",kept wealth (1-u) | (1-u) * P_win(default opp) * gain(v) | (1-u) * P_win(passive opp) * gain(v) | (1-u) * P_win(default opp)  [race position] | (1-u) * P_win(passive opp)  [race position] | (1-u) * v * P_win(default opp)  [bet size],interacted with the 50 state indicators of 2.3.1
 Q scaling,Q = B_t · θ_t'φ,value roughly proportional to wealth; target ratio ρ = B_{t+1}/B_t
 LSPI rounds,6,same number of rounds as the exploratory run
-games per round,6000,about 60k transitions per round
-behaviour ε (LSPI),0.1,0.1 and 0.2 gave the same final value
+games per round,6000,about 42k transitions per round
+behaviour ε (LSPI),0.1,keeps most data on the greedy path
 replay buffer,6 rounds (all data),off-policy: old data stays valid
 ridge penalty,1.0,stabilises OLS for rarely visited bins
 Q-learning α_k,0.05/(1+k/20)^0.6,"decreasing step size, per batch"

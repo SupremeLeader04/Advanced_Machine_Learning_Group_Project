@@ -291,61 +291,25 @@ def plot_control_final_comparison(
     test_wealth: dict[str, np.ndarray],
     output_dir: str | Path,
 ) -> None:
-    """Compare test-game mean wealth and show uncertainty separately from dispersion."""
+    """Plot test-game mean wealth with standard-error bars and a hold-cash baseline."""
     plt.switch_backend("Agg")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
     methods = ("MC", "SARSA")
     colors = ["#1f77b4", "#ff7f0e"]
-    interval_upper = 100.0
+    means = []
+    standard_errors = []
     for position, (method, color) in enumerate(zip(methods, colors), start=1):
         values = np.asarray(test_wealth[method], dtype=float)
         if values.ndim != 1 or len(values) < 2 or not np.all(np.isfinite(values)):
             raise ValueError(
                 f"{method} test wealth must be a finite vector with at least two games."
             )
-
         mean = float(values.mean())
-        median = float(np.median(values))
-        sd = float(values.std(ddof=1))
-        lower, upper = _bootstrap_mean_interval(values, seed=2026 + position)
-        ax.vlines(position, lower, upper, color=color, linewidth=2)
-        ax.hlines([lower, upper], position - 0.035, position + 0.035, color=color)
-        ax.scatter(
-            position,
-            mean,
-            color=color,
-            marker="o",
-            s=55,
-            zorder=3,
-            label="Mean (95% bootstrap interval)" if position == 1 else None,
-        )
-        ax.scatter(
-            position,
-            median,
-            color=color,
-            marker="D",
-            s=40,
-            edgecolor="white",
-            linewidth=0.7,
-            zorder=4,
-            label="Median" if position == 1 else None,
-        )
-        interval_upper = max(interval_upper, upper)
-        ax.text(
-            position,
-            0.97,
-            (
-                f"Mean {mean:.1f}  |  Median {median:.1f}\n"
-                f"SD {sd:.1f}  |  Max {values.max():.1f}\n"
-                f"Games {len(values)}"
-            ),
-            transform=ax.get_xaxis_transform(),
-            ha="center",
-            va="top",
-            fontsize=9,
-        )
+        standard_error = float(values.std(ddof=1) / np.sqrt(len(values)))
+        means.append(mean)
+        standard_errors.append(standard_error)
 
     ax.axhline(
         100.0,
@@ -354,7 +318,16 @@ def plot_control_final_comparison(
         linewidth=1.2,
         label="Hold cash: terminal wealth = 100",
     )
-    y_max = max(125.0, interval_upper * 1.12)
+    ax.bar(
+        np.arange(1, len(methods) + 1),
+        means,
+        yerr=standard_errors,
+        capsize=6,
+        color=colors,
+        width=0.6,
+        error_kw={"linewidth": 1.5, "ecolor": "black"},
+    )
+    y_max = max(125.0, max(np.asarray(means) + np.asarray(standard_errors)) * 1.12)
     ax.set(
         xticks=np.arange(1, len(methods) + 1),
         xticklabels=methods,
@@ -364,15 +337,8 @@ def plot_control_final_comparison(
         title="Held-out control performance",
         ylim=(80.0, y_max),
     )
-    ax.legend(loc="lower right")
+    ax.legend(loc="best")
     ax.grid(axis="y", alpha=0.25)
-    fig.text(
-        0.5,
-        0.015,
-        "Whiskers: 95% percentile-bootstrap interval for the mean. SD describes test-game spread.",
-        ha="center",
-        fontsize=9,
-    )
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     fig.savefig(output_dir / "control_final_comparison.png", dpi=200)
     plt.close(fig)

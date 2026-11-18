@@ -10,9 +10,6 @@ from features import feasible_actions, state_action_features, state_features
 from prediction import learning_rate
 from visualisations import (
     plot_control_final_comparison,
-    plot_control_learning_curves,
-    plot_control_schedules,
-    plot_control_tuning_heatmaps,
     plot_strategy,
     save_csv,
 )
@@ -25,15 +22,13 @@ FINAL_TEST_SEED = 20000
 def exploration_rate(
     episode: int,
     epsilon_0: float = 0.30,
-    epsilon_min: float = 0.05,
     decay_scale: float = 750.0,
     exponent: float = 0.8,
 ) -> float:
-    """Decay exploration while retaining a small probability of random actions."""
-    return max(
-        epsilon_min,
-        epsilon_0 / (1.0 + episode / decay_scale) ** exponent,
-    )
+    """Decay epsilon-greedy exploration toward zero."""
+    if episode < 0:
+        raise ValueError("episode must be non-negative.")
+    return epsilon_0 / (1.0 + episode / decay_scale) ** exponent
 
 
 def epsilon_greedy(
@@ -332,10 +327,8 @@ def run_experiment(
         method: np.full_like(screening_scores[method], np.nan)
         for method in ("MC", "SARSA")
     }
-    tuning_rows = []
     screening_rows = []
     refinement_rows = []
-    selected_rows = []
     rows_by_candidate = {}
     results = {}
 
@@ -373,7 +366,6 @@ def run_experiment(
                     "refinement_seeds": "",
                     "selected": False,
                 }
-                tuning_rows.append(row)
                 screening_rows.append({
                     "method": method,
                     "alpha_0": alpha_0,
@@ -383,11 +375,6 @@ def run_experiment(
                     "screening_episodes": n_screen_episodes,
                 })
                 rows_by_candidate[(method, i, j)] = row
-                save_csv(output_dir / "hyperparameter_results.csv", tuning_rows)
-                save_csv(output_dir / "screening_results.csv", screening_rows)
-                plot_control_tuning_heatmaps(
-                    alpha_values, epsilon_values, screening_scores, output_dir
-                )
 
         ranked = np.argsort(screening_scores[method], axis=None)[::-1]
         finalists = [
@@ -456,13 +443,6 @@ def run_experiment(
                 "refinement_validation_games": n_validation_games,
                 "refinement_seeds": n_seeds,
             })
-            plot_control_tuning_heatmaps(
-                alpha_values,
-                epsilon_values,
-                refinement_scores,
-                output_dir,
-                stage="refinement",
-            )
             if mean > best_mean:
                 best_mean = mean
                 best_candidate = (i, j)
@@ -474,25 +454,11 @@ def run_experiment(
                     "validation_scores": validation_scores,
                     "checkpoints": candidate_checkpoints,
                 }
-            save_csv(output_dir / "hyperparameter_results.csv", tuning_rows)
-            save_csv(output_dir / "refinement_results.csv", refinement_rows)
 
         if method_result is None or best_candidate is None:
             raise RuntimeError(f"No refined candidate was produced for {method}.")
         best_row = rows_by_candidate[(method, *best_candidate)]
         best_row["selected"] = True
-        save_csv(output_dir / "hyperparameter_results.csv", tuning_rows)
-        selected_rows.append({
-            "method": method,
-            "selected_seed": int(training_seeds[np.argmax(method_result["validation_scores"])]),
-            "alpha_0": method_result["alpha_0"],
-            "epsilon_0": method_result["epsilon_0"],
-            "validation_mean_wealth": best_mean,
-            "validation_sd_across_seeds": float(method_result["validation_scores"].std()),
-            "validation_games": n_validation_games,
-            "refinement_seeds": n_seeds,
-        })
-        save_csv(output_dir / "selected_policy_summary.csv", selected_rows)
         print(
             f"Selected {method}: alpha_0={method_result['alpha_0']:g}, "
             f"epsilon_0={method_result['epsilon_0']:g}, "
@@ -501,6 +467,9 @@ def run_experiment(
         )
         # Keep refined candidate runs as the final training runs; do not retrain them.
         results[method] = method_result
+
+    save_csv(output_dir / "screening_results.csv", screening_rows)
+    save_csv(output_dir / "refinement_results.csv", refinement_rows)
 
     _print_summary_table(
         "Screening results (validation wealth after 750 episodes)",
@@ -521,41 +490,6 @@ def run_experiment(
         method: results[method]["weights"]
         for method in ("MC", "SARSA")
     }
-    curves = {
-        method: results[method]["curves"]
-        for method in ("MC", "SARSA")
-    }
-    checkpoints = results["MC"]["checkpoints"]
-    schedule_steps = np.arange(1, n_episodes + 1)
-    plot_control_schedules(
-        schedule_steps,
-        {
-            method: [
-                learning_rate(int(episode), alpha_0=selected[method][0])
-                for episode in schedule_steps
-            ]
-            for method in ("MC", "SARSA")
-        },
-        {
-            method: [
-                exploration_rate(int(episode), epsilon_0=selected[method][1])
-                for episode in schedule_steps
-            ]
-            for method in ("MC", "SARSA")
-        },
-        output_dir,
-    )
-
-    for method in ("MC", "SARSA"):
-        curves[method] = np.asarray(curves[method])
-    if not np.array_equal(
-        checkpoints, results["SARSA"]["checkpoints"]
-    ):
-        raise RuntimeError("MC and SARSA refinement checkpoints do not match.")
-
-    plot_control_learning_curves(
-        checkpoints, curves, None, "baseline", output_dir
-    )
 
     final_indices = {
         method: int(np.argmax(results[method]["validation_scores"]))
@@ -570,7 +504,6 @@ def run_experiment(
     plot_strategy(policy_samples["MC"], policy_samples["SARSA"], output_dir)
 
     evaluation_rows = []
-    final_policy_rows = []
     test_wealth = {}
     for method in ("MC", "SARSA"):
         alpha_0, epsilon_0 = selected[method]
@@ -593,41 +526,14 @@ def run_experiment(
             "median_wealth": result["median"],
             "win_rate_vs_default": result["win_rate"],
         })
-        final_policy_rows.append({
-            "method": method,
-            "selected_seed": int(training_seeds[final_indices[method]]),
-            "alpha_0": alpha_0,
-            "epsilon_0": epsilon_0,
-            "test_games": n_test_games,
-            "test_seed": FINAL_TEST_SEED,
-            "mean_wealth": result["mean"],
-            "wealth_se": result["se"],
-            "median_wealth": result["median"],
-            "win_rate_vs_default": result["win_rate"],
-        })
 
     save_csv(output_dir / "final_test_results.csv", evaluation_rows)
-    save_csv(output_dir / "selected_policy_test.csv", final_policy_rows)
     _print_summary_table(
         "Final held-out test results (same unseen test set for both methods)",
-        final_policy_rows,
-        ["method", "selected_seed", "alpha_0", "epsilon_0", "mean_wealth", "median_wealth", "win_rate_vs_default"],
+        evaluation_rows,
+        ["method", "alpha_0", "epsilon_0", "mean_wealth", "wealth_se", "median_wealth", "win_rate_vs_default"],
     )
     plot_control_final_comparison(test_wealth, output_dir)
-    np.savez(
-        output_dir / "trained_weights.npz",
-        mc=np.stack(weights["MC"]),
-        sarsa=np.stack(weights["SARSA"]),
-        checkpoints=checkpoints,
-        mc_validation=curves["MC"],
-        sarsa_validation=curves["SARSA"],
-        training_seeds=np.asarray(training_seeds),
-        alpha_mc=selected["MC"][0],
-        epsilon_mc=selected["MC"][1],
-        alpha_sarsa=selected["SARSA"][0],
-        epsilon_sarsa=selected["SARSA"][1],
-        test_seed=FINAL_TEST_SEED,
-    )
     print(f"Saved control results in {output_dir.resolve()}")
 
 
